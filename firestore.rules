@@ -1,0 +1,30 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Allow read, write on custom_sounds for saving and playing custom MP3 alerts
+    match /custom_sounds/{soundId=**} {
+      allow read, write: if true;
+    }
+
+    // Allow read, write on the configs collection for any valid username ID string (fallback / public cache)
+    match /configs/{username} {
+      allow read, write: if username != null;
+    }
+
+    // Secure user profile resource: only the logged-in owner can read or write their own profile
+    match /users/{userId} {
+      allow read, write: if request.auth != null && request.auth.uid == userId;
+    }
+
+    // Allow read, write on test connection document for diagnostics
+    match /test/{docId} {
+      allow read, write: if docId is string && docId.size() <= 128;
+    }
+
+    // Global default-deny safety net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

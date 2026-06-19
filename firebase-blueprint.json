@@ -1,0 +1,35 @@
+{
+  "entities": {
+    "UserConfig": {
+      "title": "User Config",
+      "description": "Unified TikTok configuration for a specific broadcaster, optionally mapped or stored per logged-in user",
+      "type": "object",
+      "properties": {
+        "username": { "type": "string", "description": "TikTok username linked to this profile" },
+        "mappings": { "type": "array", "description": "Gift sound mappings" },
+        "superFans": { "type": "array", "description": "Super fans configuration" },
+        "ttsEnabled": { "type": "boolean", "description": "Whether TTS is enabled" },
+        "ttsVolume": { "type": "number", "description": "Volume of text-to-speech speaker" },
+        "ttsProvider": { "type": "string", "description": "TTS services provider selected" },
+        "ttsVoiceURI": { "type": "string", "description": "TTS voice URI or model indicator" },
+        "ttsRate": { "type": "number", "description": "Speech speed modifier rate" },
+        "ttsReadUsernames": { "type": "boolean", "description": "Whether username prefix is read out" },
+        "ttsReaderTargets": { "type": "array", "description": "Filter list of read scopes" },
+        "superFanWelcomeEnabled": { "type": "boolean", "description": "Enable voice greeting welcome for superfans" },
+        "aiVoiceMode": { "type": "string", "description": "AI character voice filter applied" },
+        "backgroundPriority": { "type": "boolean", "description": "Priority player thread background execution" }
+      },
+      "required": ["mappings"]
+    }
+  },
+  "firestore": {
+    "/configs/{username}": {
+      "schema": "UserConfig",
+      "description": "User TikTok interactive settings"
+    },
+    "/users/{userId}": {
+      "schema": "UserConfig",
+      "description": "Personal secure configuration synced with Firebase Auth"
+    }
+  }
+}

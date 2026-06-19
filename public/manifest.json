@@ -1,0 +1,25 @@
+{
+  "name": "Creator Still - Lector de Tik Tok",
+  "short_name": "Creator Still",
+  "description": "Lector inteligente de chats de TikTok con alertas de voz, sonidos personalizados y conexión premium.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0d1117",
+  "theme_color": "#ff0050",
+  "orientation": "any",
+  "scope": "/",
+  "icons": [
+    {
+      "src": "https://adventure-8t03kq.fly.dev/img/logo.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "https://adventure-8t03kq.fly.dev/img/logo.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}

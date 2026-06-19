@@ -1,0 +1,6 @@
+{
+  "name": "Creator Still",
+  "description": "Conecta con TikTok Live en tiempo real, detecta regalos enviados por espectadores, autodescarga íconos y reproduce sonidos de alertas personalizados.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
