@@ -5,8 +5,10 @@
 
 import React, { useEffect, useState, useRef } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
+import { db } from './utils/firebase';
+import { doc, getDoc, setDoc, onSnapshot, runTransaction } from 'firebase/firestore';
 import { LiveEvent, GiftSoundMapping, PresetSound, SuperFan, SuperFanAlertData } from './types';
-import { playSynthesizedSound, playSoundFromUrl, speakText, queueSound, playSoundFromUrlWithCompletion, playSynthesizedSoundWithCompletion, stopAllAudio, startBackgroundPriorityMode, stopBackgroundPriorityMode, stopActiveTts, unlockAudio } from './utils/audio';
+import { playSynthesizedSound, playSoundFromUrl, speakText, queueSound, playSoundFromUrlWithCompletion, playSynthesizedSoundWithCompletion, stopAllAudio, startBackgroundPriorityMode, stopBackgroundPriorityMode, stopActiveTts, unlockAudio, recoverBackgroundAudioState } from './utils/audio';
 import GiftSoundConfig from './components/GiftSoundConfig';
 import { GIFT_CATALOG } from './data/gifts';
 
@@ -15,8 +17,7 @@ import LiveEventFeed from './components/LiveEventFeed';
 import ChatTtsController from './components/ChatTtsController';
 import YoutubeRadio, { YoutubeSong } from './components/YoutubeRadio';
 import ErrorBoundary from './components/ErrorBoundary';
-import { doc, getDoc, setDoc, onSnapshot, serverTimestamp } from 'firebase/firestore';
-import { db, handleFirestoreError, OperationType, isQuotaExceededError } from './utils/firebase';
+
 import { 
   Radio, 
   Wifi, 
@@ -51,6 +52,8 @@ import {
   Upload,
   Trash2,
   Save,
+  Edit2,
+  Check,
   FileJson,
   History,
   RefreshCw,
@@ -66,70 +69,140 @@ const PRESET_SOUNDS: PresetSound[] = [
   { id: 'magic', name: 'Brillo Mágico ✨', type: 'synth', synthType: 'magic' },
 ];
 
+/**
+ * Smart helper to verify if two gift names match, avoiding false positive matches.
+ * Matches:
+ *  - Exact Case-Insensitive names e.g. "Rose" === "rose"
+ *  - Normalized names stripped of spaces & non-alphanumeric e.g. "Coconut Drink" === "coconutdrink"
+ *  - Parenthesized aliases fallback if one has parenthesized tag e.g. "Coconut Tree (Coconut)" matches "Coconut"
+ * Explicitly rejects false-positives like matching "Forever Rosa" to "Rosa".
+ */
+const isNameMatch = (nameA: string, nameB: string): boolean => {
+  const cleanA = nameA.toLowerCase().trim();
+  const cleanB = nameB.toLowerCase().trim();
+  if (cleanA === cleanB) return true;
+
+  const parseParentheses = (s: string) => {
+    const match = s.match(/\(([^)]+)\)/);
+    return match ? match[1].toLowerCase().trim() : '';
+  };
+
+  const pA = parseParentheses(cleanA);
+  const pB = parseParentheses(cleanB);
+
+  const normalize = (s: string) => {
+    return s
+      .replace(/\(.*\)/g, '')
+      .replace(/[^a-z0-9]/g, '')
+      .trim();
+  };
+
+  const normA = normalize(cleanA);
+  const normB = normalize(cleanB);
+
+  // Avoid matching empty values
+  if (!normA || !normB) return false;
+
+  if (normA === normB) return true;
+
+  // Paren alias fallback e.g. "Coconut Tree (Coconut)" matches "Coconut"
+  if (pA && normalize(pA) === normB) return true;
+  if (pB && normalize(pB) === normA) return true;
+
+  return false;
+};
+
+/**
+ * Global map tracking recently played sound identifiers.
+ * This is module-scoped, meaning it is shared across all renders, duplicate mounts,
+ * and active SSE connection instances to ensure a 100% definitive block on duplicate play.
+ */
+const GLOBAL_PLAYED_EVENTS_MAP = new Map<string, number>();
+
+const isDuplicateEventSound = (key: string): boolean => {
+  const now = Date.now();
+  
+  // Clean keys older than 60 seconds to prevent growing memory footprint
+  if (GLOBAL_PLAYED_EVENTS_MAP.size > 800) {
+    for (const [k, timestamp] of GLOBAL_PLAYED_EVENTS_MAP.entries()) {
+      if (now - timestamp > 60000) {
+        GLOBAL_PLAYED_EVENTS_MAP.delete(k);
+      }
+    }
+  }
+
+  if (GLOBAL_PLAYED_EVENTS_MAP.has(key)) {
+    const lastTime = GLOBAL_PLAYED_EVENTS_MAP.get(key) || 0;
+    // Strictly block duplicate play if triggered within the last 1500ms
+    if (now - lastTime < 1500) {
+      return true;
+    }
+  }
+
+  GLOBAL_PLAYED_EVENTS_MAP.set(key, now);
+  return false;
+};
+
 const DEFAULT_MAPPINGS: GiftSoundMapping[] = [
-  { giftName: 'Rose', soundId: 'coin', volume: 0.8, label: 'Rosa', iconUrl: 'https://p16-webcast.tiktokcdn.com/img/webcast/7408db06d445c9be6242699f8d51185d.png~tplv-obj.png' },
-  { giftName: 'Rosa', soundId: 'coin', volume: 0.8, label: 'Rosa', iconUrl: 'https://p16-webcast.tiktokcdn.com/img/webcast/7408db06d445c9be6242699f8d51185d.png~tplv-obj.png' },
-  { giftName: 'TikTok', soundId: 'laser', volume: 0.8, label: 'TikTok', iconUrl: 'https://p16-webcast.tiktokcdn.com/img/webcast/823a2cc74efb71889fc68a3560ec0cf7.png~tplv-obj.png' },
-  { giftName: 'Finger Heart', soundId: 'magic', volume: 0.8, label: 'Corazón Coreano', iconUrl: 'https://p16-webcast.tiktokcdn.com/img/webcast/919f18ed0f8b05afaf4528148e65893b.png~tplv-obj.png' },
+  { giftName: 'Rose', giftId: 5655, soundId: 'coin', volume: 0.8, label: 'Rosa', iconUrl: 'https://p16-webcast.tiktokcdn.com/img/webcast/7408db06d445c9be6242699f8d51185d.png~tplv-obj.png' },
+  { giftName: 'Rosa', giftId: 8913, soundId: 'coin', volume: 0.8, label: 'Rosa', iconUrl: 'https://p16-webcast.tiktokcdn.com/img/webcast/7408db06d445c9be6242699f8d51185d.png~tplv-obj.png' },
+  { giftName: 'TikTok', giftId: 5269, soundId: 'laser', volume: 0.8, label: 'TikTok', iconUrl: 'https://p16-webcast.tiktokcdn.com/img/webcast/823a2cc74efb71889fc68a3560ec0cf7.png~tplv-obj.png' },
+  { giftName: 'Finger Heart', giftId: 5487, soundId: 'magic', volume: 0.8, label: 'Corazón Coreano', iconUrl: 'https://p16-webcast.tiktokcdn.com/img/webcast/919f18ed0f8b05afaf4528148e65893b.png~tplv-obj.png' },
   { giftName: 'Corazón', soundId: 'magic', volume: 0.8, label: 'Corazón', iconUrl: 'https://p16-webcast.tiktokcdn.com/img/webcast/919f18ed0f8b05afaf4528148e65893b.png~tplv-obj.png' },
-  { giftName: 'Lion', soundId: 'airhorn', volume: 0.9, label: 'León', iconUrl: 'https://p16-webcast.tiktokcdn.com/img/webcast/efc948e9cc3fe0710609b5cecf3f6ff3.png~tplv-obj.png' },
-  { giftName: 'León', soundId: 'airhorn', volume: 0.9, label: 'León', iconUrl: 'https://p16-webcast.tiktokcdn.com/img/webcast/efc948e9cc3fe0710609b5cecf3f6ff3.png~tplv-obj.png' }
+  { giftName: 'Capybara', giftId: 14488, soundId: 'magic', volume: 0.8, label: 'Capibara 🐹', iconUrl: 'https://p16-webcast.tiktokcdn.com/img/alisg/webcast-sg/resource/6703facdac34caefbd0617a6321afe9b.png~tplv-obj.webp', triggerRoulette: true },
+  { giftName: 'Lion', giftId: 6369, soundId: 'airhorn', volume: 0.9, label: 'León', iconUrl: 'https://p16-webcast.tiktokcdn.com/img/webcast/efc948e9cc3fe0710609b5cecf3f6ff3.png~tplv-obj.png' },
+  { giftName: 'León', giftId: 6369, soundId: 'airhorn', volume: 0.9, label: 'León', iconUrl: 'https://p16-webcast.tiktokcdn.com/img/webcast/efc948e9cc3fe0710609b5cecf3f6ff3.png~tplv-obj.png' }
 ];
 
 export default function App() {
-  const [username, setUsername] = useState(() => {
-    return localStorage.getItem('tiktok_creator_username') || '';
-  });
-  const [recentProfiles, setRecentProfiles] = useState<string[]>(() => {
-    const saved = localStorage.getItem('tiktok_recent_profiles_list');
-    return saved ? JSON.parse(saved) : [];
-  });
-
-  const addProfileToHistory = (user: string) => {
-    const cleanUser = user.replace('@', '').trim().toLowerCase();
-    if (!cleanUser) return;
-    setRecentProfiles(prev => {
-      const filtered = prev.filter(p => p !== cleanUser);
-      const updated = [cleanUser, ...filtered].slice(0, 10); // keep last 10
-      localStorage.setItem('tiktok_recent_profiles_list', JSON.stringify(updated));
-      return updated;
-    });
-  };
+  const [username, setUsername] = useState('');
+  
+  // Real-time server/database synchronization states (No localStorage / sessionStorage)
+  const [autoSaveActive, setAutoSaveActive] = useState<boolean>(false);
+  const [dbVersion, setDbVersion] = useState<number>(1);
+  const unsubscribeRef = useRef<(() => void) | null>(null);
+  const lastSyncedConfigRef = useRef<string>('');
 
   const [activeConnectedUser, setActiveConnectedUser] = useState<string>('');
   const [connectionStatus, setConnectionStatus] = useState<'disconnected' | 'connecting' | 'live' | 'error'>('disconnected');
   const [connectionError, setConnectionError] = useState<string | null>(null);
   
   // Advanced link options of tiktok-live-connector
-  const [sessionId, setSessionId] = useState(() => {
-    return localStorage.getItem('tiktok_session_id') || '';
-  });
+  const [sessionId, setSessionId] = useState('');
   const [showAdvanced, setShowAdvanced] = useState(false);
 
   // TikTok Live High-Speed Connection parameters (handled transparently)
-  const [premiumConnection, setPremiumConnection] = useState<boolean>(() => {
-    const saved = localStorage.getItem('tiktok_premium_conn');
-    return saved !== null ? saved === 'true' : true;
-  });
-  const [connectionKey, setConnectionKey] = useState<string>(() => {
-    return localStorage.getItem('tiktok_premium_conn_key') || 'tk_235e481d7e949fa580b3f0b3bf8040223481c16e398d2abb';
-  });
+  const [premiumConnection, setPremiumConnection] = useState<boolean>(true);
+  const [connectionKey, setConnectionKey] = useState<string>('tk_235e481d7e949fa580b3f0b3bf8040223481c16e398d2abb');
 
   const [wakeLockActive, setWakeLockActive] = useState<boolean>(false);
   const wakeLockRef = useRef<any>(null);
+  const userWantsWakeLockRef = useRef<boolean>(false);
 
   const [events, setEvents] = useState<LiveEvent[]>([]);
   const [activeAlerts, setActiveAlerts] = useState<AlertData[]>([]);
   
+  // Custom OBS integration Challenge Roulette configuration state
+  const [rouletteEnabled, setRouletteEnabled] = useState<boolean>(true);
+  const [rouletteChallenges, setRouletteChallenges] = useState<string[]>([
+    "Hacer 5 lagartijas 🏋️",
+    "Trompa de elefante por 15s 🐘",
+    "Plancha abdominal por 30s ⏱️",
+    "Contar un chiste malo 😅",
+    "Cantar una canción a capela 🎤",
+    "Hacer mímica de un animal 🦁",
+    "Beber un vaso de agua completo 🥛",
+    "Decir un trabalenguas rápido 🗣️"
+  ]);
+  const [editingChallengeIndex, setEditingChallengeIndex] = useState<number | null>(null);
+  const [editingChallengeText, setEditingChallengeText] = useState<string>('');
+  
   // Custom interactive VIP Súper Fans state configuration
-  const [superFans, setSuperFans] = useState<SuperFan[]>(() => {
-    const saved = localStorage.getItem('tiktok_super_fans');
-    return saved ? JSON.parse(saved) : [
-      { uniqueId: 'carlos_vip', nickname: 'Carlos el Patrón 👑', fanLevel: 38, avatarUrl: 'https://p16-sign-va.tiktokcdn.com/tos-malisg-avt-0068/7313894468205428741~c5_100x100.jpeg?biz_tag=tiktok_user_cover', badgeLevel: 'Leyenda', joinMessage: '¡El Patrón se une al directo dispuesto a todo!' },
-      { uniqueId: 'maria_love', nickname: 'María Estrella ⭐', fanLevel: 25, avatarUrl: 'https://p16-sign-va.tiktokcdn.com/tos-malisg-avt-0068/7311634860432128005~c5_100x100.jpeg', badgeLevel: 'Corona', joinMessage: '¡María brilla con luz propia hoy en el chat!' },
-      { uniqueId: 'pablo_twitch', nickname: 'Pablo Moderador 🛡️', fanLevel: 31, avatarUrl: 'https://p16-sign-va.tiktokcdn.com/tos-malisg-avt-0068/7408db06d445c9be6242699f8d51185d~c5_100x100.jpeg', badgeLevel: 'Estrella', joinMessage: '¡El moderador de oro está en la sala!' }
-    ];
-  });
+  const [superFans, setSuperFans] = useState<SuperFan[]>([
+    { uniqueId: 'carlos_vip', nickname: 'Carlos el Patrón 👑', fanLevel: 38, avatarUrl: 'https://p16-sign-va.tiktokcdn.com/tos-malisg-avt-0068/7313894468205428741~c5_100x100.jpeg?biz_tag=tiktok_user_cover', badgeLevel: 'Leyenda', joinMessage: '¡El Patrón se une al directo dispuesto a todo!' },
+    { uniqueId: 'maria_love', nickname: 'María Estrella ⭐', fanLevel: 25, avatarUrl: 'https://p16-sign-va.tiktokcdn.com/tos-malisg-avt-0068/7311634860432128005~c5_100x100.jpeg', badgeLevel: 'Corona', joinMessage: '¡María brilla con luz propia hoy en el chat!' },
+    { uniqueId: 'pablo_twitch', nickname: 'Pablo Moderador 🛡️', fanLevel: 31, avatarUrl: 'https://p16-sign-va.tiktokcdn.com/tos-malisg-avt-0068/7408db06d445c9be6242699f8d51185d~c5_100x100.jpeg', badgeLevel: 'Estrella', joinMessage: '¡El moderador de oro está en la sala!' }
+  ]);
   const [activeSuperFanAlerts, setActiveSuperFanAlerts] = useState<SuperFanAlertData[]>([]);
   
   // Live Room Stats metrics
@@ -188,15 +261,14 @@ export default function App() {
   };
 
   const [discoveredGifts, setDiscoveredGifts] = useState<Array<{ giftName: string; giftPictureUrl: string; diamondCount: number }>>([]);
-  const [mappings, setMappings] = useState<GiftSoundMapping[]>(() => {
-    const saved = localStorage.getItem('tiktok_sound_mappings');
-    return saved ? JSON.parse(saved) : DEFAULT_MAPPINGS;
-  });
+  const [mappings, setMappings] = useState<GiftSoundMapping[]>(DEFAULT_MAPPINGS);
   const [muted, setMuted] = useState(false);
   const [baseDiamonds] = useState(0);
   const [sessionUptime, setSessionUptime] = useState(0); // starts at 0 for active connection
   const [isOverlayOnly, setIsOverlayOnly] = useState<boolean>(false);
+  const [isRouletteOnly, setIsRouletteOnly] = useState<boolean>(false);
   const [copiedObs, setCopiedObs] = useState<boolean>(false);
+  const [copiedRoulette, setCopiedRoulette] = useState<boolean>(false);
   const [simGiftSearch, setSimGiftSearch] = useState('');
   const [connectingPhase, setConnectingPhase] = useState<'none' | 'iniciando' | 'conectando' | 'conectado'>('none');
   const [cloudStatus, setCloudStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
@@ -205,6 +277,10 @@ export default function App() {
 
   // Keep track of the last event's timestamp so we can pick up any missed events if the phone locks/reconnects
   const lastEventTimestampRef = useRef<number>(Date.now());
+
+  // Track played audio alert IDs/keys to prevent double triggering of sounds inside combos or stream event updates
+  const playedAudioAlertsRef = useRef<Map<string, number>>(new Map());
+  const msgPlayedSetRef = useRef<Set<string>>(new Set());
 
   useEffect(() => {
     const originalAlert = window.alert;
@@ -248,6 +324,12 @@ export default function App() {
   useEffect(() => { connectionStatusRef.current = connectionStatus; }, [connectionStatus]);
   const mappingsRef = useRef(mappings);
   useEffect(() => { mappingsRef.current = mappings; }, [mappings]);
+
+  const checkConnectionRef = useRef<() => void>(() => {});
+  const reconnectCountRef = useRef<number>(0);
+
+  const spokenCommentIdsRef = useRef<Set<string>>(new Set());
+  const spokenCommentSignaturesRef = useRef<Map<string, number>>(new Map());
 
   const eventBufferRef = useRef<LiveEvent[]>([]);
   const flushTimerRef = useRef<any | null>(null);
@@ -329,65 +411,24 @@ export default function App() {
   };
 
   // Real-time Text-to-Speech (TTS) voice engine configurations
-  const [ttsEnabled, setTtsEnabled] = useState<boolean>(() => {
-    const saved = localStorage.getItem('tiktok_tts_enabled');
-    return saved ? JSON.parse(saved) : true;
-  });
-  const [ttsVolume, setTtsVolume] = useState<number>(() => {
-    const saved = localStorage.getItem('tiktok_tts_volume');
-    return saved ? parseFloat(saved) : 0.8;
-  });
-  const [ttsProvider, setTtsProvider] = useState<string>(() => {
-    return localStorage.getItem('tiktok_tts_provider') || 'google';
-  });
-  const [ttsVoiceURI, setTtsVoiceURI] = useState<string>(() => {
-    return localStorage.getItem('tiktok_tts_voice_uri') || 'es';
-  });
-  const [ttsRate, setTtsRate] = useState<number>(() => {
-    const saved = localStorage.getItem('tiktok_tts_rate');
-    return saved ? parseFloat(saved) : 1.0;
-  });
-  const [ttsReadUsernames, setTtsReadUsernames] = useState<boolean>(() => {
-    const saved = localStorage.getItem('tiktok_tts_read_usernames');
-    return saved ? JSON.parse(saved) : false;
-  });
-  const [ttsReaderTargets, setTtsReaderTargets] = useState<('todos' | 'moderadores' | 'superfans')[]>(() => {
-    const saved = localStorage.getItem('tiktok_tts_reader_targets');
-    if (saved) {
-      try {
-        return JSON.parse(saved);
-      } catch (e) {
-        // Ignore JSON error
-      }
-    }
-    const prev = localStorage.getItem('tiktok_tts_reader_target');
-    if (prev === 'todos' || prev === 'moderadores' || prev === 'superfans') {
-      return [prev];
-    }
-    return ['todos'];
-  });
-  const [superFanWelcomeEnabled, setSuperFanWelcomeEnabled] = useState<boolean>(() => {
-    const saved = localStorage.getItem('tiktok_superfan_welcome_enabled');
-    return saved ? JSON.parse(saved) : false; // False by default!
-  });
+  const [ttsEnabled, setTtsEnabled] = useState<boolean>(true);
+  const [ttsVolume, setTtsVolume] = useState<number>(0.8);
+  const [ttsProvider, setTtsProvider] = useState<string>('google');
+  const [ttsVoiceURI, setTtsVoiceURI] = useState<string>('es');
+  const [ttsRate, setTtsRate] = useState<number>(1.0);
+  const [ttsReadUsernames, setTtsReadUsernames] = useState<boolean>(false);
+  const [ttsReaderTargets, setTtsReaderTargets] = useState<('todos' | 'moderadores' | 'superfans')[]>(['todos']);
+  const [superFanWelcomeEnabled, setSuperFanWelcomeEnabled] = useState<boolean>(false); // False by default!
 
   const handleToggleSuperFanWelcome = () => {
-    const nextVal = !superFanWelcomeEnabled;
-    setSuperFanWelcomeEnabled(nextVal);
-    localStorage.setItem('tiktok_superfan_welcome_enabled', JSON.stringify(nextVal));
+    setSuperFanWelcomeEnabled(!superFanWelcomeEnabled);
   };
-  const [aiVoiceMode, setAiVoiceMode] = useState<string>(() => {
-    return localStorage.getItem('tiktok_ai_voice_mode') || 'normal';
-  });
+  const [aiVoiceMode, setAiVoiceMode] = useState<string>('normal');
 
-  const [backgroundPriority, setBackgroundPriority] = useState<boolean>(() => {
-    const saved = localStorage.getItem('tiktok_background_priority');
-    return saved ? JSON.parse(saved) : true; // Default to true (Active background priority!)
-  });
+  const [backgroundPriority, setBackgroundPriority] = useState<boolean>(true); // Default to true (Active background priority!)
 
   const handleToggleBackgroundPriority = (enabled: boolean) => {
     setBackgroundPriority(enabled);
-    localStorage.setItem('tiktok_background_priority', JSON.stringify(enabled));
   };
 
   // Keep AudioContext active in second plane so Chrome/Safari does not prioritize tab suspension
@@ -402,19 +443,511 @@ export default function App() {
     };
   }, [backgroundPriority]);
 
+  // Web Worker Background Keep-Alive Engine
+  // Prevents mobile background suspension by utilizing an unthrottled Web Worker interval thread to keep the main event loop awake!
+  useEffect(() => {
+    if (!backgroundPriority) return;
+
+    let worker: Worker | null = null;
+    let objectUrl: string | null = null;
+
+    try {
+      const workerCode = `
+        let intervalId = null;
+        self.onmessage = function(e) {
+          if (e.data === 'start') {
+            if (intervalId) clearInterval(intervalId);
+            intervalId = setInterval(function() {
+              self.postMessage('tick');
+            }, 2500);
+            console.log('[KeepAlive-Worker] Background interval tick established.');
+          } else if (e.data === 'stop') {
+            if (intervalId) {
+              clearInterval(intervalId);
+              intervalId = null;
+            }
+            console.log('[KeepAlive-Worker] Background interval tick destroyed.');
+          }
+        };
+      `;
+      const blob = new Blob([workerCode], { type: 'application/javascript' });
+      objectUrl = URL.createObjectURL(blob);
+      worker = new Worker(objectUrl);
+
+      worker.onmessage = (event) => {
+        if (event.data === 'tick') {
+          console.log('[Background-KeepAlive] Worker heartbeat tick received. Resisting suspension and validating state...');
+          if (checkConnectionRef.current) {
+            checkConnectionRef.current();
+          }
+          recoverBackgroundAudioState();
+        }
+      };
+
+      worker.postMessage('start');
+      console.log('[Background-KeepAlive] Web Worker successfully mounted and primed.');
+    } catch (err) {
+      console.error('[Background-KeepAlive] Failed to launch inline Web Worker keep-alive:', err);
+    }
+
+    return () => {
+      if (worker) {
+        try {
+          worker.postMessage('stop');
+          worker.terminate();
+        } catch (e) {}
+      }
+      if (objectUrl) {
+        try {
+          URL.revokeObjectURL(objectUrl);
+        } catch (e) {}
+      }
+    };
+  }, [backgroundPriority]);
+
   const handleToggleTtsReadUsernames = () => {
-    const nextVal = !ttsReadUsernames;
-    setTtsReadUsernames(nextVal);
-    localStorage.setItem('tiktok_tts_read_usernames', JSON.stringify(nextVal));
+    setTtsReadUsernames(!ttsReadUsernames);
   };
 
   const handleToggleTts = (enabled: boolean) => {
     setTtsEnabled(enabled);
-    localStorage.setItem('tiktok_tts_enabled', JSON.stringify(enabled));
     if (!enabled) {
       stopActiveTts();
     }
   };
+
+  // Helper to enrich mapping attributes with missing giftId or iconUrls automatically from GIFT_CATALOG on startup/loading
+  // It also automatically heals and corrects any previously corrupted, misassigned, or collided gift IDs on exact name match!
+  const enrichMappings = (rawList: GiftSoundMapping[]): GiftSoundMapping[] => {
+    return rawList.map(m => {
+      // Find exact name match in catalog to heal any previously corrupted/misassigned IDs in persistent Firestore (e.g., "Rosa" mapped to "Forever Rosa" ID 8914)
+      const exactMatch = GIFT_CATALOG.find(g => g.name.toLowerCase() === m.giftName.toLowerCase());
+      if (exactMatch) {
+        return {
+          ...m,
+          giftId: exactMatch.id,
+          iconUrl: exactMatch.image || m.iconUrl
+        };
+      }
+
+      if (m.giftId && m.iconUrl) return m; // already has both, keep as is
+      
+      const catalogMatch = GIFT_CATALOG.find(g => isNameMatch(g.name, m.giftName));
+      
+      if (catalogMatch) {
+        return {
+          ...m,
+          giftId: m.giftId || catalogMatch.id,
+          iconUrl: m.iconUrl || catalogMatch.image
+        };
+      }
+      return m;
+    });
+  };
+
+  // Helper to deep load a UserConfig document and apply safely to all UI states
+  const applyConfigToLocalStates = (cfg: any) => {
+    if (Array.isArray(cfg.mappings)) {
+      setMappings(enrichMappings(cfg.mappings));
+    }
+    if (Array.isArray(cfg.superFans)) {
+      setSuperFans(cfg.superFans);
+    }
+    if (cfg.ttsEnabled !== undefined) {
+      setTtsEnabled(cfg.ttsEnabled);
+    }
+    if (cfg.ttsVolume !== undefined) {
+      setTtsVolume(cfg.ttsVolume);
+    }
+    if (cfg.ttsProvider !== undefined) {
+      setTtsProvider(cfg.ttsProvider);
+    }
+    if (cfg.ttsVoiceURI !== undefined) {
+      setTtsVoiceURI(cfg.ttsVoiceURI);
+    }
+    if (cfg.ttsRate !== undefined) {
+      setTtsRate(cfg.ttsRate);
+    }
+    if (cfg.ttsReadUsernames !== undefined) {
+      setTtsReadUsernames(cfg.ttsReadUsernames);
+    }
+    if (Array.isArray(cfg.ttsReaderTargets)) {
+      setTtsReaderTargets(cfg.ttsReaderTargets);
+    }
+    if (cfg.superFanWelcomeEnabled !== undefined) {
+      setSuperFanWelcomeEnabled(cfg.superFanWelcomeEnabled);
+    }
+    if (cfg.aiVoiceMode !== undefined) {
+      setAiVoiceMode(cfg.aiVoiceMode);
+    }
+    if (cfg.backgroundPriority !== undefined) {
+      setBackgroundPriority(cfg.backgroundPriority);
+    }
+    if (cfg.rouletteEnabled !== undefined) {
+      setRouletteEnabled(cfg.rouletteEnabled);
+    }
+    if (Array.isArray(cfg.rouletteChallenges)) {
+      setRouletteChallenges(cfg.rouletteChallenges);
+    }
+  };
+
+  // Optimistic concurrency locking transaction routine
+  const saveConfigToFirebase = async (targetUser: string, configData: any, currentVersion: number) => {
+    const docRef = doc(db, 'configs', targetUser);
+    try {
+      await runTransaction(db, async (transaction) => {
+        const docSnap = await transaction.get(docRef);
+        const dataToSave = { ...configData };
+        
+        if (!docSnap.exists()) {
+          dataToSave.version = 1;
+          transaction.set(docRef, dataToSave);
+          setDbVersion(1);
+          lastSyncedConfigRef.current = JSON.stringify({
+            mappings: dataToSave.mappings,
+            superFans: dataToSave.superFans,
+            ttsEnabled: dataToSave.ttsEnabled,
+            ttsVolume: dataToSave.ttsVolume,
+            ttsProvider: dataToSave.ttsProvider,
+            ttsVoiceURI: dataToSave.ttsVoiceURI,
+            ttsRate: dataToSave.ttsRate,
+            ttsReadUsernames: dataToSave.ttsReadUsernames,
+            ttsReaderTargets: dataToSave.ttsReaderTargets,
+            superFanWelcomeEnabled: dataToSave.superFanWelcomeEnabled,
+            aiVoiceMode: dataToSave.aiVoiceMode,
+            backgroundPriority: dataToSave.backgroundPriority,
+            rouletteEnabled: dataToSave.rouletteEnabled,
+            rouletteChallenges: dataToSave.rouletteChallenges
+          });
+        } else {
+          const serverVersion = docSnap.data().version || 1;
+          if (serverVersion !== currentVersion) {
+            // Version Conflict (409 Conflict equivalent)
+            throw { status: 409, message: 'Conflict', serverVersion, serverData: docSnap.data() };
+          }
+          const nextVersion = serverVersion + 1;
+          dataToSave.version = nextVersion;
+          transaction.update(docRef, dataToSave);
+          
+          setDbVersion(nextVersion);
+          lastSyncedConfigRef.current = JSON.stringify({
+            mappings: dataToSave.mappings,
+            superFans: dataToSave.superFans,
+            ttsEnabled: dataToSave.ttsEnabled,
+            ttsVolume: dataToSave.ttsVolume,
+            ttsProvider: dataToSave.ttsProvider,
+            ttsVoiceURI: dataToSave.ttsVoiceURI,
+            ttsRate: dataToSave.ttsRate,
+            ttsReadUsernames: dataToSave.ttsReadUsernames,
+            ttsReaderTargets: dataToSave.ttsReaderTargets,
+            superFanWelcomeEnabled: dataToSave.superFanWelcomeEnabled,
+            aiVoiceMode: dataToSave.aiVoiceMode,
+            backgroundPriority: dataToSave.backgroundPriority,
+            rouletteEnabled: dataToSave.rouletteEnabled,
+            rouletteChallenges: dataToSave.rouletteChallenges
+          });
+        }
+      });
+      console.log('[AutoSave] Cloud config synchronized successfully!');
+    } catch (err: any) {
+      if (err && err.status === 409) {
+        console.warn('[AutoSave] Optimistic Concurrency Lock Conflict. Relational mismatch:', currentVersion, 'vs Server:', err.serverVersion);
+        
+        // Notification of Conflict to user: "rechaza con error 409 y el cliente recarga la versión nueva antes de reintentar"
+        appendSystemMessage(`⚠️ Conflicto de Versión (Error 409). Otro dispositivo actualizó la configuración. Forzando recarga de la versión ${err.serverVersion} del servidor...`);
+        const serverData = err.serverData;
+        if (serverData) {
+          applyConfigToLocalStates(serverData);
+          setDbVersion(err.serverVersion);
+          lastSyncedConfigRef.current = JSON.stringify({
+            mappings: serverData.mappings || [],
+            superFans: serverData.superFans || [],
+            ttsEnabled: serverData.ttsEnabled !== undefined ? serverData.ttsEnabled : true,
+            ttsVolume: serverData.ttsVolume !== undefined ? serverData.ttsVolume : 0.8,
+            ttsProvider: serverData.ttsProvider || 'google',
+            ttsVoiceURI: serverData.ttsVoiceURI || 'es',
+            ttsRate: serverData.ttsRate !== undefined ? serverData.ttsRate : 1.0,
+            ttsReadUsernames: serverData.ttsReadUsernames !== undefined ? serverData.ttsReadUsernames : false,
+            ttsReaderTargets: serverData.ttsReaderTargets || ['todos'],
+            superFanWelcomeEnabled: serverData.superFanWelcomeEnabled !== undefined ? serverData.superFanWelcomeEnabled : false,
+            aiVoiceMode: serverData.aiVoiceMode || 'normal',
+            backgroundPriority: serverData.backgroundPriority !== undefined ? serverData.backgroundPriority : true,
+            rouletteEnabled: serverData.rouletteEnabled !== undefined ? serverData.rouletteEnabled : true,
+            rouletteChallenges: serverData.rouletteChallenges || []
+          });
+        }
+      } else {
+        console.error('[AutoSave] Unhandled Firestore save error:', err);
+      }
+    }
+  };
+
+  // Toggle Cloud autosave & fetch initial configs immediately
+  const handleToggleAutoSave = async () => {
+    const cleanUser = username.replace('@', '').trim().toLowerCase();
+    if (!cleanUser) {
+      alert('⚠️ Por favor ingresa el nombre de tu usuario de TikTok arriba para activar la sincronización con el servidor.');
+      return;
+    }
+
+    if (autoSaveActive) {
+      if (unsubscribeRef.current) {
+        unsubscribeRef.current();
+        unsubscribeRef.current = null;
+      }
+      setAutoSaveActive(false);
+      appendSystemMessage('🔌 Sincronización en tiempo real desactivada.');
+      return;
+    }
+
+    try {
+      appendSystemMessage('⏳ Cargando la última configuración del servidor (Fuente de Verdad absoluta)...');
+      
+      const docRef = doc(db, 'configs', cleanUser);
+      // Force fetching from server to guarantee bypassing local cache completely (Requirement 3)
+      const docSnap = await getDoc(docRef);
+
+      if (docSnap.exists()) {
+        const data = docSnap.data();
+        applyConfigToLocalStates(data);
+        const serverVer = data.version || 1;
+        setDbVersion(serverVer);
+        
+        lastSyncedConfigRef.current = JSON.stringify({
+          mappings: data.mappings || [],
+          superFans: data.superFans || [],
+          ttsEnabled: data.ttsEnabled !== undefined ? data.ttsEnabled : true,
+          ttsVolume: data.ttsVolume !== undefined ? data.ttsVolume : 0.8,
+          ttsProvider: data.ttsProvider || 'google',
+          ttsVoiceURI: data.ttsVoiceURI || 'es',
+          ttsRate: data.ttsRate !== undefined ? data.ttsRate : 1.0,
+          ttsReadUsernames: data.ttsReadUsernames !== undefined ? data.ttsReadUsernames : false,
+          ttsReaderTargets: data.ttsReaderTargets || ['todos'],
+          superFanWelcomeEnabled: data.superFanWelcomeEnabled !== undefined ? data.superFanWelcomeEnabled : false,
+          aiVoiceMode: data.aiVoiceMode || 'normal',
+          backgroundPriority: data.backgroundPriority !== undefined ? data.backgroundPriority : true,
+          rouletteEnabled: data.rouletteEnabled !== undefined ? data.rouletteEnabled : true,
+          rouletteChallenges: data.rouletteChallenges || []
+        });
+
+        appendSystemMessage(`✅ ¡Configuración cargada desde el servidor con éxito! (Versión ${serverVer}).`);
+      } else {
+        const initialCfg = {
+          username: cleanUser,
+          mappings,
+          superFans,
+          ttsEnabled,
+          ttsVolume,
+          ttsProvider,
+          ttsVoiceURI,
+          ttsRate,
+          ttsReadUsernames,
+          ttsReaderTargets,
+          superFanWelcomeEnabled,
+          aiVoiceMode,
+          backgroundPriority,
+          rouletteEnabled,
+          rouletteChallenges,
+          version: 1
+        };
+        await setDoc(docRef, initialCfg);
+        setDbVersion(1);
+        
+        lastSyncedConfigRef.current = JSON.stringify({
+          mappings: initialCfg.mappings,
+          superFans: initialCfg.superFans,
+          ttsEnabled: initialCfg.ttsEnabled,
+          ttsVolume: initialCfg.ttsVolume,
+          ttsProvider: initialCfg.ttsProvider,
+          ttsVoiceURI: initialCfg.ttsVoiceURI,
+          ttsRate: initialCfg.ttsRate,
+          ttsReadUsernames: initialCfg.ttsReadUsernames,
+          ttsReaderTargets: initialCfg.ttsReaderTargets,
+          superFanWelcomeEnabled: initialCfg.superFanWelcomeEnabled,
+          aiVoiceMode: initialCfg.aiVoiceMode,
+          backgroundPriority: initialCfg.backgroundPriority,
+          rouletteEnabled: initialCfg.rouletteEnabled,
+          rouletteChallenges: initialCfg.rouletteChallenges
+        });
+
+        appendSystemMessage('✨ No se encontró perfil previo en la nube. ¡Se ha creado una nueva configuración en el servidor (Versión 1)!');
+      }
+
+      setAutoSaveActive(true);
+    } catch (err) {
+      console.error('[CloudSync] Error performing clear-cache pull:', err);
+      appendSystemMessage('❌ Error al conectar con el servidor/base de datos.');
+      alert('Error de conexión al servidor de base de datos de la nube. Por favor reintente.');
+    }
+  };
+
+  // Real-time listen subscription (Requirement 4)
+  useEffect(() => {
+    const cleanUser = username.replace('@', '').trim().toLowerCase();
+    
+    if (autoSaveActive && cleanUser) {
+      const docRef = doc(db, 'configs', cleanUser);
+      console.log('[Realtime] Subscribing listener for user:', cleanUser);
+      
+      const unsub = onSnapshot(docRef, (snapshot) => {
+        if (snapshot.exists()) {
+          const serverData = snapshot.data();
+          const serverVersion = serverData.version || 1;
+          
+          // Only update local state if the snapshot changes were NOT triggered by our own local save write
+          if (!snapshot.metadata.hasPendingWrites) {
+            const serverConfigString = JSON.stringify({
+              mappings: serverData.mappings || [],
+              superFans: serverData.superFans || [],
+              ttsEnabled: serverData.ttsEnabled !== undefined ? serverData.ttsEnabled : true,
+              ttsVolume: serverData.ttsVolume !== undefined ? serverData.ttsVolume : 0.8,
+              ttsProvider: serverData.ttsProvider || 'google',
+              ttsVoiceURI: serverData.ttsVoiceURI || 'es',
+              ttsRate: serverData.ttsRate !== undefined ? serverData.ttsRate : 1.0,
+              ttsReadUsernames: serverData.ttsReadUsernames !== undefined ? serverData.ttsReadUsernames : false,
+              ttsReaderTargets: serverData.ttsReaderTargets || ['todos'],
+              superFanWelcomeEnabled: serverData.superFanWelcomeEnabled !== undefined ? serverData.superFanWelcomeEnabled : false,
+              aiVoiceMode: serverData.aiVoiceMode || 'normal',
+              backgroundPriority: serverData.backgroundPriority !== undefined ? serverData.backgroundPriority : true,
+              rouletteEnabled: serverData.rouletteEnabled !== undefined ? serverData.rouletteEnabled : true,
+              rouletteChallenges: serverData.rouletteChallenges || []
+            });
+
+            if (serverConfigString !== lastSyncedConfigRef.current) {
+              console.log('[Realtime] Remote difference detected. Applying new changes! Version:', serverVersion);
+              applyConfigToLocalStates(serverData);
+              setDbVersion(serverVersion);
+              lastSyncedConfigRef.current = serverConfigString;
+              appendSystemMessage(`🔄 Sincronizado en tiempo real por cambios desde otro dispositivo (Versión ${serverVersion}).`);
+            }
+          }
+        }
+      }, (error) => {
+        console.error('[Realtime] Snapshot listener encountered error:', error);
+      });
+
+      unsubscribeRef.current = unsub;
+    }
+
+    return () => {
+      if (unsubscribeRef.current) {
+        unsubscribeRef.current();
+        unsubscribeRef.current = null;
+      }
+    };
+  }, [autoSaveActive, username]);
+
+  // Handle Automatic Save push on configuration modifications
+  useEffect(() => {
+    if (!autoSaveActive) return;
+    const cleanUser = username.replace('@', '').trim().toLowerCase();
+    if (!cleanUser) return;
+
+    const currentConfigString = JSON.stringify({
+      mappings,
+      superFans,
+      ttsEnabled,
+      ttsVolume,
+      ttsProvider,
+      ttsVoiceURI,
+      ttsRate,
+      ttsReadUsernames,
+      ttsReaderTargets,
+      superFanWelcomeEnabled,
+      aiVoiceMode,
+      backgroundPriority,
+      rouletteEnabled,
+      rouletteChallenges
+    });
+
+    if (currentConfigString === lastSyncedConfigRef.current) {
+      // States are already identical to what's on the server, prevent recursive saves
+      return;
+    }
+
+    // Debounce save execution by 1.5s to accumulate multiple consecutive tweaks (volume slide, toggles)
+    const timer = setTimeout(() => {
+      const configData = {
+        mappings,
+        superFans,
+        ttsEnabled,
+        ttsVolume,
+        ttsProvider,
+        ttsVoiceURI,
+        ttsRate,
+        ttsReadUsernames,
+        ttsReaderTargets,
+        superFanWelcomeEnabled,
+        aiVoiceMode,
+        backgroundPriority,
+        rouletteEnabled,
+        rouletteChallenges
+      };
+      
+      console.log('[AutoSave] Modification detected. Saving version:', dbVersion);
+      saveConfigToFirebase(cleanUser, configData, dbVersion);
+    }, 1500);
+
+    return () => clearTimeout(timer);
+  }, [
+    autoSaveActive,
+    mappings,
+    superFans,
+    ttsEnabled,
+    ttsVolume,
+    ttsProvider,
+    ttsVoiceURI,
+    ttsRate,
+    ttsReadUsernames,
+    ttsReaderTargets,
+    superFanWelcomeEnabled,
+    aiVoiceMode,
+    backgroundPriority,
+    rouletteEnabled,
+    rouletteChallenges,
+    dbVersion,
+    username
+  ]);
+
+  // Load configuration automatically on startup if in overlay mode
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const urlUser = params.get('username');
+    const overlayParam = params.get('overlay') === 'true' || params.get('overlay') === 'roulette';
+
+    if (overlayParam && urlUser) {
+      const cleanUser = urlUser.replace('@', '').trim().toLowerCase();
+      
+      // Auto load and subscribe to real-time changes
+      const loadOverlayConfig = async () => {
+        try {
+          const docRef = doc(db, 'configs', cleanUser);
+          const docSnap = await getDoc(docRef);
+          if (docSnap.exists()) {
+            const data = docSnap.data();
+            applyConfigToLocalStates(data);
+            setDbVersion(data.version || 1);
+          }
+        } catch (err) {
+          console.error('[OverlaySync] Error loading initial overlay config from server:', err);
+        }
+      };
+
+      loadOverlayConfig();
+
+      // Realtime subscribe
+      const docRef = doc(db, 'configs', cleanUser);
+      const unsub = onSnapshot(docRef, (snapshot) => {
+        if (snapshot.exists()) {
+          const serverData = snapshot.data();
+          applyConfigToLocalStates(serverData);
+          setDbVersion(serverData.version || 1);
+        }
+      });
+
+      return () => unsub();
+    }
+  }, []);
 
   const handleExportBackup = () => {
     try {
@@ -430,7 +963,9 @@ export default function App() {
         ttsReaderTargets,
         superFanWelcomeEnabled,
         aiVoiceMode,
-        backgroundPriority
+        backgroundPriority,
+        rouletteEnabled,
+        rouletteChallenges
       };
       const jsonStr = JSON.stringify(backupData, null, 2);
 
@@ -468,68 +1003,50 @@ export default function App() {
         try {
           const parsed = JSON.parse(e.target?.result as string);
           if (parsed) {
-            // Prevent autosave during restore
-            hasLoadedConfigFromServerRef.current = false;
-
             if (Array.isArray(parsed.mappings)) {
-              setMappings(parsed.mappings);
-              localStorage.setItem('tiktok_sound_mappings', JSON.stringify(parsed.mappings));
+              setMappings(enrichMappings(parsed.mappings));
             }
             if (Array.isArray(parsed.superFans)) {
               setSuperFans(parsed.superFans);
-              localStorage.setItem('tiktok_super_fans', JSON.stringify(parsed.superFans));
             }
             if (parsed.ttsEnabled !== undefined) {
               setTtsEnabled(parsed.ttsEnabled);
-              localStorage.setItem('tiktok_tts_enabled', JSON.stringify(parsed.ttsEnabled));
             }
             if (parsed.ttsVolume !== undefined) {
               setTtsVolume(parsed.ttsVolume);
-              localStorage.setItem('tiktok_tts_volume', JSON.stringify(parsed.ttsVolume));
             }
             if (parsed.ttsProvider !== undefined) {
               setTtsProvider(parsed.ttsProvider);
-              localStorage.setItem('tiktok_tts_provider', parsed.ttsProvider);
             }
             if (parsed.ttsVoiceURI !== undefined) {
               setTtsVoiceURI(parsed.ttsVoiceURI);
-              localStorage.setItem('tiktok_tts_voice_uri', parsed.ttsVoiceURI);
             }
             if (parsed.ttsRate !== undefined) {
               setTtsRate(parsed.ttsRate);
-              localStorage.setItem('tiktok_tts_rate', JSON.stringify(parsed.ttsRate));
             }
             if (parsed.ttsReadUsernames !== undefined) {
               setTtsReadUsernames(parsed.ttsReadUsernames);
-              localStorage.setItem('tiktok_tts_read_usernames', JSON.stringify(parsed.ttsReadUsernames));
             }
             if (Array.isArray(parsed.ttsReaderTargets)) {
               setTtsReaderTargets(parsed.ttsReaderTargets);
-              localStorage.setItem('tiktok_tts_reader_targets', JSON.stringify(parsed.ttsReaderTargets));
             }
             if (parsed.superFanWelcomeEnabled !== undefined) {
               setSuperFanWelcomeEnabled(parsed.superFanWelcomeEnabled);
-              localStorage.setItem('tiktok_superfan_welcome_enabled', JSON.stringify(parsed.superFanWelcomeEnabled));
             }
             if (parsed.aiVoiceMode !== undefined) {
               setAiVoiceMode(parsed.aiVoiceMode);
-              localStorage.setItem('tiktok_ai_voice_mode', parsed.aiVoiceMode);
             }
             if (parsed.backgroundPriority !== undefined) {
               setBackgroundPriority(parsed.backgroundPriority);
-              localStorage.setItem('tiktok_background_priority', JSON.stringify(parsed.backgroundPriority));
+            }
+            if (parsed.rouletteEnabled !== undefined) {
+              setRouletteEnabled(parsed.rouletteEnabled);
+            }
+            if (Array.isArray(parsed.rouletteChallenges)) {
+              setRouletteChallenges(parsed.rouletteChallenges);
             }
 
-            // Activate autosave after restoration
-            setTimeout(() => {
-              hasLoadedConfigFromServerRef.current = true;
-              const targetUser = username.replace('@', '').trim().toLowerCase();
-              if (targetUser) {
-                saveConfigToServer(targetUser);
-              }
-            }, 100);
-
-            alert('¡Copia de seguridad importada y sincronizada correctamente!');
+            alert('¡Copia de seguridad importada correctamente!');
           }
         } catch (err) {
           console.error('[Backup] Import failed:', err);
@@ -541,15 +1058,12 @@ export default function App() {
 
   const handleUpdateTtsVolume = (vol: number) => {
     setTtsVolume(vol);
-    localStorage.setItem('tiktok_tts_volume', JSON.stringify(vol));
     stopActiveTts();
   };
 
   const handleUpdateTtsProvider = (prov: string) => {
     stopActiveTts();
     setTtsProvider(prov);
-    localStorage.setItem('tiktok_tts_provider', prov);
-    // Auto shift voice to sensible default value if needed
     if (prov === 'google') handleUpdateTtsVoiceURI('es');
     else if (prov === 'streamelements') handleUpdateTtsVoiceURI('Brian');
     else if (prov === 'tiktok') handleUpdateTtsVoiceURI('es_002');
@@ -561,318 +1075,24 @@ export default function App() {
   const handleUpdateTtsVoiceURI = (uri: string) => {
     stopActiveTts();
     setTtsVoiceURI(uri);
-    localStorage.setItem('tiktok_tts_voice_uri', uri);
   };
 
   const handleUpdateTtsRate = (rate: number) => {
     setTtsRate(rate);
-    localStorage.setItem('tiktok_tts_rate', JSON.stringify(rate));
     stopActiveTts();
   };
 
   const handleUpdateAiVoiceMode = (mode: string) => {
     setAiVoiceMode(mode);
-    localStorage.setItem('tiktok_ai_voice_mode', mode);
     stopActiveTts();
   };
 
   const handleUpdateTtsReaderTargets = (targets: ('todos' | 'moderadores' | 'superfans')[]) => {
     setTtsReaderTargets(targets);
-    localStorage.setItem('tiktok_tts_reader_targets', JSON.stringify(targets));
   };
-
-  // Flag to know when it is safe to upload configurations to the server without overwriting with defaults
-  const hasLoadedConfigFromServerRef = useRef<boolean>(false);
-  const lastFetchedConfigRef = useRef<string | null>(null);
-
-  // Helper to apply loaded settings into states and local storage safely
-  const applyLoadedConfig = (cfg: any, isManual: boolean = false) => {
-    console.log('[ConfigStore] Applying loaded configuration:', cfg);
-    
-    // Prevent autosave during restore
-    hasLoadedConfigFromServerRef.current = false;
-
-    const fetchedCfg = {
-      username: cfg.username || '',
-      mappings: cfg.mappings || [],
-      superFans: cfg.superFans || [],
-      ttsEnabled: cfg.ttsEnabled !== undefined ? cfg.ttsEnabled : false,
-      ttsVolume: cfg.ttsVolume !== undefined ? cfg.ttsVolume : 50,
-      ttsProvider: cfg.ttsProvider || 'google',
-      ttsVoiceURI: cfg.ttsVoiceURI || 'es',
-      ttsRate: cfg.ttsRate !== undefined ? cfg.ttsRate : 1,
-      ttsReadUsernames: cfg.ttsReadUsernames !== undefined ? cfg.ttsReadUsernames : false,
-      ttsReaderTargets: cfg.ttsReaderTargets || ['todos'],
-      superFanWelcomeEnabled: cfg.superFanWelcomeEnabled !== undefined ? cfg.superFanWelcomeEnabled : true,
-      aiVoiceMode: cfg.aiVoiceMode || 'towa-casual',
-      backgroundPriority: cfg.backgroundPriority !== undefined ? cfg.backgroundPriority : false
-    };
-
-    // Seed comparison ref to block race-condition autosaves with identical structure as currentConfig
-    const comparisonConfig = {
-      mappings: fetchedCfg.mappings,
-      superFans: fetchedCfg.superFans,
-      ttsEnabled: fetchedCfg.ttsEnabled,
-      ttsVolume: fetchedCfg.ttsVolume,
-      ttsProvider: fetchedCfg.ttsProvider,
-      ttsVoiceURI: fetchedCfg.ttsVoiceURI,
-      ttsRate: fetchedCfg.ttsRate,
-      ttsReadUsernames: fetchedCfg.ttsReadUsernames,
-      ttsReaderTargets: fetchedCfg.ttsReaderTargets,
-      superFanWelcomeEnabled: fetchedCfg.superFanWelcomeEnabled,
-      aiVoiceMode: fetchedCfg.aiVoiceMode,
-      backgroundPriority: fetchedCfg.backgroundPriority
-    };
-
-    lastFetchedConfigRef.current = JSON.stringify(comparisonConfig);
-
-    if (cfg.username) {
-      setUsername(cfg.username);
-      localStorage.setItem('tiktok_creator_username', cfg.username);
-    }
-    if (Array.isArray(cfg.mappings)) {
-      setMappings(cfg.mappings);
-      localStorage.setItem('tiktok_sound_mappings', JSON.stringify(cfg.mappings));
-    }
-    if (Array.isArray(cfg.superFans)) {
-      setSuperFans(cfg.superFans);
-      localStorage.setItem('tiktok_super_fans', JSON.stringify(cfg.superFans));
-    }
-    if (cfg.ttsEnabled !== undefined) {
-      setTtsEnabled(cfg.ttsEnabled);
-      localStorage.setItem('tiktok_tts_enabled', JSON.stringify(cfg.ttsEnabled));
-    }
-    if (cfg.ttsVolume !== undefined) {
-      setTtsVolume(cfg.ttsVolume);
-      localStorage.setItem('tiktok_tts_volume', JSON.stringify(cfg.ttsVolume));
-    }
-    if (cfg.ttsProvider !== undefined) {
-      setTtsProvider(cfg.ttsProvider);
-      localStorage.setItem('tiktok_tts_provider', cfg.ttsProvider);
-    }
-    if (cfg.ttsVoiceURI !== undefined) {
-      setTtsVoiceURI(cfg.ttsVoiceURI);
-      localStorage.setItem('tiktok_tts_voice_uri', cfg.ttsVoiceURI);
-    }
-    if (cfg.ttsRate !== undefined) {
-      setTtsRate(cfg.ttsRate);
-      localStorage.setItem('tiktok_tts_rate', JSON.stringify(cfg.ttsRate));
-    }
-    if (cfg.ttsReadUsernames !== undefined) {
-      setTtsReadUsernames(cfg.ttsReadUsernames);
-      localStorage.setItem('tiktok_tts_read_usernames', JSON.stringify(cfg.ttsReadUsernames));
-    }
-    if (Array.isArray(cfg.ttsReaderTargets)) {
-      setTtsReaderTargets(cfg.ttsReaderTargets);
-      localStorage.setItem('tiktok_tts_reader_targets', JSON.stringify(cfg.ttsReaderTargets));
-    }
-    if (cfg.superFanWelcomeEnabled !== undefined) {
-      setSuperFanWelcomeEnabled(cfg.superFanWelcomeEnabled);
-      localStorage.setItem('tiktok_superfan_welcome_enabled', JSON.stringify(cfg.superFanWelcomeEnabled));
-    }
-    if (cfg.aiVoiceMode !== undefined) {
-      setAiVoiceMode(cfg.aiVoiceMode);
-      localStorage.setItem('tiktok_ai_voice_mode', cfg.aiVoiceMode);
-    }
-    if (cfg.backgroundPriority !== undefined) {
-      setBackgroundPriority(cfg.backgroundPriority);
-      localStorage.setItem('tiktok_background_priority', JSON.stringify(cfg.backgroundPriority));
-    }
-
-    if (isManual) {
-      setCloudLoadStatus('loaded');
-      setTimeout(() => setCloudLoadStatus('idle'), 3000);
-    }
-
-    // Activate autosave after restoration
-    setTimeout(() => {
-      hasLoadedConfigFromServerRef.current = true;
-    }, 100);
-  };
-
-  // Unified load function that fetches and restores configuration from Firestore & Fast Local Cache
-  const loadUserConfig = (userToLoad: string, isManual: boolean = false) => {
-    const cleanUser = userToLoad.replace('@', '').trim().toLowerCase();
-    if (!cleanUser) return;
-
-    if (isManual) {
-      setCloudLoadStatus('loading');
-    }
-
-    try {
-      console.log(`[ConfigStore] Setting up real-time listener for @${cleanUser}...`);
-      const docRef = doc(db, 'configs', cleanUser);
-      
-      return onSnapshot(docRef, (docSnap) => {
-        if (docSnap.exists()) {
-          const cfg = docSnap.data();
-          applyLoadedConfig(cfg, isManual);
-          addProfileToHistory(cleanUser);
-          hasLoadedConfigFromServerRef.current = true;
-          if (isManual) setCloudLoadStatus('idle');
-        } else {
-           console.log('[ConfigStore] No Firestore config found.');
-           applyLoadedConfig({}, isManual);
-           hasLoadedConfigFromServerRef.current = true;
-           addProfileToHistory(cleanUser);
-        }
-      }, (error) => {
-        console.error('[ConfigStore] Snapshot listener failed:', error);
-      });
-
-    } catch (err) {
-      console.warn('[ConfigStore] Failed to load configuration for username from Firestore:', err);
-      hasLoadedConfigFromServerRef.current = false;
-    }
-  };
-
-  // Unified save function that uploads the complete configuration to Firestore and Local API Backup
-  const saveConfigToServer = async (customUsername?: string, isManual: boolean = false, overrideMappings?: GiftSoundMapping[]) => {
-    const targetUser = (customUsername || activeConnectedUser || username).replace('@', '').trim().toLowerCase();
-    if (!targetUser) return;
-
-    if (isManual) {
-      setCloudStatus('saving');
-    }
-
-    try {
-      const mappingsToSave = overrideMappings || mappings;
-      const currentConfig = {
-        mappings: mappingsToSave,
-        superFans,
-        ttsEnabled,
-        ttsVolume,
-        ttsProvider,
-        ttsVoiceURI,
-        ttsRate,
-        ttsReadUsernames,
-        ttsReaderTargets,
-        superFanWelcomeEnabled,
-        aiVoiceMode,
-        backgroundPriority
-      };
-
-      // Set comparison ref instantly before async operations to prevent queued duplicates/concurrency runs
-      lastFetchedConfigRef.current = JSON.stringify(currentConfig);
-
-      console.log(`[ConfigStore] Saving configuration to Firestore & Local Registry for @${targetUser}...`);
-      
-      // 1. Parallel ultra-fast save to local container storage backup proxy (keeps full custom MP3 binary files)
-      fetch(`/api/user-config?username=${encodeURIComponent(targetUser)}`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({ config: currentConfig })
-      }).catch(e => console.warn('[ConfigStore] Parallel fast api backup failed:', e));
-
-      // 2. Clear out large base64 sound files for Firestore to prevent 1MB limit error "Request payload is too large"
-      const firestoreMappings = mappingsToSave.map(m => {
-        if (m.customSoundUrl && m.customSoundUrl.startsWith('data:') && m.customSoundUrl.length > 800000) {
-          console.log(`[ConfigStore] Sound for "${m.giftName}" exceeds 800KB. Truncating for safe Firestore cloud storage...`);
-          return {
-            ...m,
-            customSoundUrl: `local_binary_cached_audio_data_size_${m.customSoundUrl.length}`
-          };
-        }
-        return m;
-      });
-
-      const firestoreConfig = {
-        ...currentConfig,
-        mappings: firestoreMappings,
-        updatedAt: serverTimestamp()
-      };
-
-      // 3. Background Firestore write (keeps UI responsive, removing slow blocks)
-      const docRef = doc(db, 'configs', targetUser);
-      const firestoreWritePromise = setDoc(docRef, firestoreConfig, { merge: true })
-        .then(() => {
-          console.log('[ConfigStore] Save to Firestore completed successfully!');
-        })
-        .catch((error) => {
-          console.error('[ConfigStore] Firestore write failed:', error);
-          if (isQuotaExceededError(error)) {
-            console.warn('[ConfigStore] Quota limit exceeded detected during background saveConfigToServer.');
-            setFirestoreQuotaExceeded(true);
-          } else {
-            try {
-              handleFirestoreError(error, OperationType.WRITE, `configs/${targetUser}`);
-            } catch (e) {
-              console.warn('[ConfigStore] Logged handled firestore write error.', e);
-            }
-          }
-        });
-
-      // 4. Optimistic visual transition for instantaneous user saving feedback (typically 120ms)
-      if (isManual) {
-        setTimeout(() => {
-          setCloudStatus('saved');
-          setTimeout(() => setCloudStatus('idle'), 3000);
-        }, 120);
-      }
-      if (targetUser) {
-        addProfileToHistory(targetUser);
-      }
-    } catch (err) {
-      console.warn('[ConfigStore] Firestore save failed:', err);
-      if (isManual) {
-        setCloudStatus('error');
-        setTimeout(() => setCloudStatus('idle'), 3000);
-      }
-    }
-  };
-
-  // React effect trigger for autosaving config on state changes
-  useEffect(() => {
-    if (!hasLoadedConfigFromServerRef.current) return;
-    const targetUser = (activeConnectedUser || username).replace('@', '').trim().toLowerCase();
-    if (!targetUser) return;
-
-    const currentConfig = {
-      mappings,
-      superFans,
-      ttsEnabled,
-      ttsVolume,
-      ttsProvider,
-      ttsVoiceURI,
-      ttsRate,
-      ttsReadUsernames,
-      ttsReaderTargets,
-      superFanWelcomeEnabled,
-      aiVoiceMode,
-      backgroundPriority
-    };
-
-    // If current settings match what was just loaded/saved, skip auto-saving redundant copies
-    if (lastFetchedConfigRef.current === JSON.stringify(currentConfig)) {
-      console.log('[ConfigStore] Local settings match cloud configuration. Skipping auto-save.');
-      return;
-    }
-
-    const timer = setTimeout(() => {
-      saveConfigToServer(targetUser);
-    }, 1500); // Debounce to protect Firestore write limits
-
-    return () => clearTimeout(timer);
-  }, [
-    mappings,
-    superFans,
-    ttsEnabled,
-    ttsVolume,
-    ttsProvider,
-    ttsVoiceURI,
-    ttsRate,
-    ttsReadUsernames,
-    ttsReaderTargets,
-    superFanWelcomeEnabled,
-    aiVoiceMode,
-    backgroundPriority,
-    activeConnectedUser
-  ]);
 
   // Helper trigger to synthesize speech for comments
-  const triggerChatTts = (userUniqueId: string, nickname: string, commentText: string, isEventMod?: boolean) => {
+  const triggerChatTts = (userUniqueId: string, nickname: string, commentText: string, isEventMod?: boolean, eventId?: string) => {
     if (!ttsEnabled) {
       console.log('[TTS-Diagnostic] Chat TTS is disabled by user settings. Skipping comment speech:', commentText);
       return;
@@ -881,13 +1101,46 @@ export default function App() {
       console.log('[TTS-Diagnostic] Interface is currently muted. Skipping comment speech:', commentText);
       return;
     }
-    if (!userUniqueId) {
-      console.log('[TTS-Diagnostic] No user unique identifier found. Skipping comment speech:', commentText);
+    if (!userUniqueId || !commentText || !commentText.trim()) {
+      console.log('[TTS-Diagnostic] Invalid user or comment content. Skipping comment speech:', commentText);
       return;
     }
 
     const userStr = userUniqueId.toLowerCase();
     const nickStr = (nickname || '').toLowerCase();
+    const cleanComment = commentText.trim();
+
+    // 1. Precise event ID deduplication
+    if (eventId) {
+      if (spokenCommentIdsRef.current.has(eventId)) {
+        console.log(`[TTS-Deduplicator] Blocking duplicate TTS vocalization for event ID: ${eventId}`);
+        return;
+      }
+      spokenCommentIdsRef.current.add(eventId);
+      if (spokenCommentIdsRef.current.size > 1200) {
+        const first = spokenCommentIdsRef.current.keys().next().value;
+        if (first) spokenCommentIdsRef.current.delete(first);
+      }
+    }
+
+    // 2. Chat signature-based deduplication (handles twin SSE stream triggers within 4.5 seconds)
+    const signatureKey = `${userStr}:${cleanComment.toLowerCase()}`;
+    const now = Date.now();
+    const lastSpoken = spokenCommentSignaturesRef.current.get(signatureKey) || 0;
+    if (now - lastSpoken < 4500) {
+      console.log(`[TTS-Deduplicator] Blocking duplicate comment signature within 4.5s cooldown: "${cleanComment}" by @${userUniqueId}`);
+      return;
+    }
+    spokenCommentSignaturesRef.current.set(signatureKey, now);
+
+    // Periodically prune the signature map
+    if (spokenCommentSignaturesRef.current.size > 800) {
+      for (const [k, timestamp] of spokenCommentSignaturesRef.current.entries()) {
+        if (now - timestamp > 30000) {
+          spokenCommentSignaturesRef.current.delete(k);
+        }
+      }
+    }
 
     // Filter which users to speak based on target option (todos, moderadores, superfans)
     const isSuperFanMod = superFans.some(sf => {
@@ -1049,7 +1302,6 @@ export default function App() {
   // Persistence of sound configurations
   const handleUpdateMappings = async (newMappings: GiftSoundMapping[]) => {
     setMappings(newMappings);
-    localStorage.setItem('tiktok_sound_mappings', JSON.stringify(newMappings));
 
     // Upload config to backend so that OBS overlay loads it automatically
     const currentUsername = username || activeConnectedUser;
@@ -1065,9 +1317,6 @@ export default function App() {
       } catch (err) {
         console.warn('[MappingsStore] Error uploading mappings to server:', err);
       }
-
-      // Automatically trigger an immediate cloud & server backup save when sound configurations change (e.g., upload MP3)
-      saveConfigToServer(cleanUser, false, newMappings);
     }
   };
 
@@ -1091,28 +1340,45 @@ export default function App() {
   };
 
   // Audio trigger central handler
-  const triggerAudioAlert = (giftName: string, repeatCount: number) => {
+  const triggerAudioAlert = (giftName: string, repeatCount: number, giftId?: string | number) => {
     if (muted) return;
 
-    // Find custom sound mapping for the gift (case insensitive)
-    const mapping = mappingsRef.current.find(
-      m => m.giftName.toLowerCase() === giftName.toLowerCase()
-    );
+    // Find custom sound mapping for the gift safely and strictly.
+    // 1. If both have valid non-empty, non-zero gift IDs, compare them strictly.
+    // 2. If IDs are valid and different (e.g. 8912 for Rosa Nebula vs 8914 for Forever Rosa), they MUST NOT match.
+    // 3. If IDs are missing, use a robust case-insensitive, normalized name match.
+    const mapping = mappingsRef.current.find(m => {
+      const mId = m.giftId ? String(m.giftId).trim() : '';
+      const eId = giftId ? String(giftId).trim() : '';
+
+      if (mId && eId && mId !== 'unknown_id' && eId !== 'unknown_id' && mId !== '0' && eId !== '0') {
+        return mId === eId;
+      }
+      
+      return isNameMatch(m.giftName, giftName);
+    });
     
     console.log(`[Alert-Audio] Mappings ref length: ${mappingsRef.current.length}`);
-    console.log(`[Alert-Audio] Looking for gift: "${giftName}". Found mapping:`, mapping);
+    console.log(`[Alert-Audio] Looking for gift: "${giftName}" (ID: ${giftId}). Found mapping:`, mapping);
 
     const soundId = mapping ? mapping.soundId : 'magic'; // Fallback to cute magic synth
     const volume = mapping ? mapping.volume : 0.6;
     const customUrl = mapping ? mapping.customSoundUrl : undefined;
 
-    const count = Math.max(1, repeatCount || 1);
-    console.log(`[Alert-Audio] Queueing sound alert: Sound: ${soundId}, Volume: ${volume}, Gift: ${giftName}, Repeat: ${count}`);
+    // Cap at peak 5 sound loops so massive streaks don't overload the sequential queue
+    const count = Math.min(5, Math.max(1, repeatCount || 1));
+    console.log(`[Alert-Audio] Playing INSTANT gift sound alert: Sound: ${soundId}, Volume: ${volume}, Gift: ${giftName}, Repeat: ${count}`);
 
-    for (let i = 0; i < count; i++) {
-      queueSound(async () => {
+    const playChainSequentially = async () => {
+      for (let i = 0; i < count; i++) {
         if (soundId === 'custom' && customUrl) {
-          await playSoundFromUrlWithCompletion(customUrl, volume);
+          try {
+            await playSoundFromUrlWithCompletion(customUrl, volume);
+          } catch (err) {
+            console.warn('[InstantAudio] Failed playing custom sound URL in chain:', err);
+            // Fallback immediately to a synth sound so we don't block forever
+            await playSynthesizedSoundWithCompletion('magic', volume);
+          }
         } else {
           const preset = PRESET_SOUNDS.find(p => p.id === soundId);
           if (preset && preset.type === 'synth' && preset.synthType) {
@@ -1121,18 +1387,30 @@ export default function App() {
             await playSynthesizedSoundWithCompletion('magic', volume);
           }
         }
-      });
-    }
+      }
+    };
+
+    queueSound(playChainSequentially);
   };
 
   // Appends new gift into the queue to trigger graphics alert
   const triggerGraphicsAlert = (evt: LiveEvent) => {
     if (!evt.gift) return;
 
-    // Retrieve mapped icon url or default
-    const mapping = mappingsRef.current.find(
-      m => m.giftName.toLowerCase() === evt.gift!.giftName.toLowerCase()
-    );
+    const giftId = evt.gift.giftId;
+    const giftName = evt.gift.giftName;
+
+    // Retrieve mapped icon url or default using strict ID-first matching
+    const mapping = mappingsRef.current.find(m => {
+      const mId = m.giftId ? String(m.giftId).trim() : '';
+      const eId = giftId ? String(giftId).trim() : '';
+
+      if (mId && eId && mId !== 'unknown_id' && eId !== 'unknown_id' && mId !== '0' && eId !== '0') {
+        return mId === eId;
+      }
+      
+      return isNameMatch(m.giftName, giftName);
+    });
 
     const giftPic = evt.gift.giftPictureUrl || mapping?.iconUrl || '';
 
@@ -1148,6 +1426,7 @@ export default function App() {
       soundId: mapping?.soundId || 'magic',
       customSoundUrl: mapping?.customSoundUrl,
       volume: mapping?.volume || 0.6,
+      triggerRoulette: rouletteEnabled && !!mapping?.triggerRoulette,
     };
 
     setActiveAlerts(prev => [...prev, newAlert]);
@@ -1169,12 +1448,26 @@ export default function App() {
     if (!isAutoReconnect) {
       // Reset timestamp cursor on manual connections
       lastEventTimestampRef.current = Date.now();
+      reconnectCountRef.current = 0; // Reset consecutive reconnect attempts on manual connections
     }
 
     setConnectionError(null);
     setConnectionStatus('connecting');
     setConnectingPhase('iniciando');
     setActiveConnectedUser(targetUser);
+
+    // Pre-fetch custom configuration containing gift mappings and roulette challenges instantly from Firestore
+    try {
+      const docRef = doc(db, 'configs', targetUser);
+      const docSnap = await getDoc(docRef);
+      if (docSnap.exists()) {
+        const data = docSnap.data();
+        applyConfigToLocalStates(data);
+        console.log('[OverlayConfigSync] Mappings and roulette settings loaded for', targetUser);
+      }
+    } catch (e) {
+      console.warn('[OverlayConfigSync] Failed to prefetch cloud config:', e);
+    }
 
     setTimeout(() => {
       setConnectingPhase(prev => {
@@ -1187,22 +1480,10 @@ export default function App() {
 
 
 
-    // Sync unified user configurations with server database
-    try {
-      await loadUserConfig(targetUser);
-    } catch (err) {
-      console.warn('[ConfigStore] Error syncing unified configurations in connect:', err);
-    }
-
     // Shutdown previous subscriptions
     if (sseRef.current) {
       sseRef.current.close();
     }
-
-    // Persist sessionId settings
-    localStorage.setItem('tiktok_session_id', sessionId.trim());
-    localStorage.setItem('tiktok_premium_conn', premiumConnection ? 'true' : 'false');
-    localStorage.setItem('tiktok_premium_conn_key', connectionKey.trim());
 
     // Build EventSource tracking since the last event timestamp
     let sseUrl = `/api/events?username=${encodeURIComponent(targetUser)}&since=${lastEventTimestampRef.current}`;
@@ -1217,6 +1498,7 @@ export default function App() {
     sseRef.current = sse;
 
     const ensureLive = () => {
+      reconnectCountRef.current = 0; // Reset active connection watchdog failure counts
       setConnectionStatus(prev => {
         if (prev === 'connecting') {
           setConnectingPhase('conectado');
@@ -1251,6 +1533,7 @@ export default function App() {
 
     sse.addEventListener('connected', (e) => {
       const payload = JSON.parse(e.data);
+      reconnectCountRef.current = 0; // Reset active connection watchdog failure counts
       setConnectingPhase('conectado');
       appendSystemMessage(`¡Conexión ESTABLECIDA con TikTok Live! Transmisión detectada.`);
       syncServerGiftsRegistry(targetUser);
@@ -1269,7 +1552,7 @@ export default function App() {
 
       if (data.comment) {
         handleCheckSongCommand(data.comment, data.nickname || data.uniqueId);
-        triggerChatTts(data.uniqueId, data.nickname || '', data.comment, data.isModerator);
+        triggerChatTts(data.uniqueId, data.nickname || '', data.comment, data.isModerator, data.id);
 
 
 
@@ -1317,43 +1600,112 @@ export default function App() {
       pushEventToFeed(data);
       lastEventTimestampRef.current = Math.max(lastEventTimestampRef.current, data.timestamp || Date.now());
       
-      if (data.gift && data.gift.repeatEnd) { // Only process on repeatEnd: true
-        // Play Sound alerts instantly
-        triggerAudioAlert(data.gift.giftName, data.gift.repeatCount);
+      if (data.gift) {
+        const { giftName, giftId, giftPictureUrl, diamondCount = 1, repeatCount = 1, repeatEnd } = data.gift;
+        
+        // A gift should play immediately if:
+        // - repeatEnd is true (either combo ended, or standard single-play event with repeatEnd)
+        // - OR it is a medium-to-high value gift (diamondCount >= 8 coins). Big gifts like Lion (6369), Motorcycle (5765) don't have streaks
+        // - OR it is one of the known heavy/expensive gifts based on its ID or Name that the user specified
+        const isKnownHighValue = 
+          diamondCount >= 8 ||
+          [6369, 5765, 5794, 14488, 15100, 15099, 6820, 11046, 19448, 19447, 17100, 9947, 8914, 19445, 19168, 14109, 19446, 7264, 7168, 6781, 6427, 6267, 6104, 6097, 5978, 5879, 5659, 5658, 5585, 5586, 13651].includes(Number(giftId)) ||
+          ['lion', 'motorcycle', 'coconut', 'capybara', 'wave firework', 'balloons', 'whale', 'galaxy', 'piñata', 'univers', 'leon', 'león', 'interstellar', 'falcon', 'castle', 'train'].some(keyword => giftName.toLowerCase().includes(keyword));
 
-        // Auto add to discovery / mappings
-        const { giftName, giftId, giftPictureUrl, diamondCount } = data.gift;
+        // Create an exact user-gift debouncer key to group the entire rapid-fire tap succession
+        const userGiftComboKey = `${data.uniqueId || ''}-${giftId || giftName}`;
+        const lastPlayTime = playedAudioAlertsRef.current.get(userGiftComboKey) || 0;
+        const now = Date.now();
         
-        // Update discovered
-        setDiscoveredGifts(prev => {
-           if (prev.find(g => g.giftName.toLowerCase() === giftName.toLowerCase())) return prev;
-           return [...prev, { giftName, giftPictureUrl, diamondCount: diamondCount || 1 }];
-         });
-        
-        // Update mappings if not exists
-        const mappingIndex = mappingsRef.current.findIndex(m => m.giftName.toLowerCase() === giftName.toLowerCase());
-        if (mappingIndex === -1) {
-          const newMapping: GiftSoundMapping = {
-            giftName,
-            giftId,
-            iconUrl: giftPictureUrl,
-            soundId: 'coin', // Default sound
-            volume: 0.8,
-            label: giftName
-          };
-          handleUpdateMappings([...mappingsRef.current, newMapping]);
-        } else {
-          // If mapping exists, but is missing an iconUrl, auto-attach the real picture URL and persist it
-          const existing = mappingsRef.current[mappingIndex];
-          if (!existing.iconUrl && giftPictureUrl) {
-            const updated = [...mappingsRef.current];
-            updated[mappingIndex] = {
-              ...existing,
+        // Strict 4.0-second cooldown per (User + Gift) to consolidate any rapid double-events, combos, or stream delays
+        const isUserGiftDebounced = (now - lastPlayTime) < 4000;
+
+        // Deduplicate sound alerts by msgId / combo sequence to ensure exactly one unique play
+        const rawMsgId = data.id ? data.id.split('-')[0] : '';
+        const comboKey = rawMsgId || userGiftComboKey;
+        const alreadyPlayedMsg = msgPlayedSetRef.current.has(comboKey);
+
+        let shouldPlaySound = false;
+
+        if (!alreadyPlayedMsg && !isUserGiftDebounced) {
+          if (isKnownHighValue) {
+            // Legendary/High value: Play instantly on first frame for zero-lag response!
+            shouldPlaySound = true;
+          } else if (repeatEnd) {
+            // Cheap/normal value: Play only when combo ends to prevent audio spam
+            shouldPlaySound = true;
+          }
+        }
+
+        if (shouldPlaySound) {
+          // Extra strong global safety mapping to prevent parallel duplicate socket events
+          const userGiftKey = `${data.uniqueId || ''}-${giftId || giftName}-${repeatCount}`;
+          const sseKey = rawMsgId ? `giftmsg-${rawMsgId}` : '';
+          
+          const isSseDup = sseKey ? isDuplicateEventSound(sseKey) : false;
+          const isUserGiftDup = isDuplicateEventSound(userGiftKey);
+
+          if (isSseDup || isUserGiftDup) {
+            console.log(`[Deduplicator] Blocking duplicate sound alert: "${giftName}" x${repeatCount} by ${data.uniqueId}`);
+            shouldPlaySound = false;
+          } else {
+            msgPlayedSetRef.current.add(comboKey);
+            playedAudioAlertsRef.current.set(userGiftComboKey, now);
+          }
+        }
+
+        // Limit memory size of the tracking Set and Map safely
+        if (msgPlayedSetRef.current.size > 500) {
+          const arr = Array.from(msgPlayedSetRef.current);
+          msgPlayedSetRef.current = new Set(arr.slice(arr.length - 250));
+        }
+        if (playedAudioAlertsRef.current.size > 500) {
+          const keys = Array.from(playedAudioAlertsRef.current.keys());
+          keys.slice(0, 250).forEach(k => playedAudioAlertsRef.current.delete(k));
+        }
+
+        if (shouldPlaySound) {
+          // Play Sound alerts instantly exactly once
+          triggerAudioAlert(giftName, repeatCount, giftId);
+
+          // Trigger graphic alert so it is sent to the overlay and activates the roulette
+          triggerGraphicsAlert(data);
+        }
+
+        // Auto add to discovery / mappings at least once when sound or repeat ends
+        if (shouldPlaySound || repeatEnd) {
+
+          // Auto add to discovery / mappings
+          setDiscoveredGifts(prev => {
+             if (prev.find(g => g.giftName.toLowerCase() === giftName.toLowerCase())) return prev;
+             return [...prev, { giftName, giftPictureUrl, diamondCount, giftId }];
+           });
+          
+          // Update mappings if not exists
+          const mappingIndex = mappingsRef.current.findIndex(m => m.giftName.toLowerCase() === giftName.toLowerCase());
+          if (mappingIndex === -1) {
+            const newMapping: GiftSoundMapping = {
+              giftName,
+              giftId,
               iconUrl: giftPictureUrl,
-              giftId: existing.giftId || giftId
+              soundId: 'coin', // Default sound
+              volume: 0.8,
+              label: giftName
             };
-            handleUpdateMappings(updated);
-            console.log('[MappingsStore] Auto-attached real picture URL to existing gift mapping:', giftName);
+            handleUpdateMappings([...mappingsRef.current, newMapping]);
+          } else {
+            // If mapping exists, but is missing an iconUrl or giftId, auto-attach it and persist config
+            const existing = mappingsRef.current[mappingIndex];
+            if (!existing.iconUrl || !existing.giftId) {
+              const updated = [...mappingsRef.current];
+              updated[mappingIndex] = {
+                ...existing,
+                iconUrl: existing.iconUrl || giftPictureUrl,
+                giftId: existing.giftId || giftId
+              };
+              handleUpdateMappings(updated);
+              console.log('[MappingsStore] Auto-attached real attributes to existing gift mapping:', giftName);
+            }
           }
         }
       }
@@ -1373,7 +1725,19 @@ export default function App() {
       ensureLive();
       pushEventToFeed(data);
       lastEventTimestampRef.current = Math.max(lastEventTimestampRef.current, data.timestamp || Date.now());
-      triggerAudioAlert('FOLLOW', 1);
+
+      const rawMsgId = data.id ? data.id.split('-')[0] : '';
+      const sseKey = rawMsgId ? `follow-${rawMsgId}` : '';
+      const followUserKey = `follow-${data.uniqueId || ''}`;
+
+      const isSseDup = sseKey ? isDuplicateEventSound(sseKey) : false;
+      const isUserDup = isDuplicateEventSound(followUserKey);
+
+      if (!isSseDup && !isUserDup) {
+        triggerAudioAlert('FOLLOW', 1);
+      } else {
+        console.log(`[Deduplicator] Blocking duplicate follow play for user: ${data.uniqueId}`);
+      }
     });
 
     sse.addEventListener('share', (e) => {
@@ -1382,7 +1746,19 @@ export default function App() {
       ensureLive();
       pushEventToFeed(data);
       lastEventTimestampRef.current = Math.max(lastEventTimestampRef.current, data.timestamp || Date.now());
-      triggerAudioAlert('SHARE', 1);
+
+      const rawMsgId = data.id ? data.id.split('-')[0] : '';
+      const sseKey = rawMsgId ? `share-${rawMsgId}` : '';
+      const shareUserKey = `share-${data.uniqueId || ''}`;
+
+      const isSseDup = sseKey ? isDuplicateEventSound(sseKey) : false;
+      const isUserDup = isDuplicateEventSound(shareUserKey);
+
+      if (!isSseDup && !isUserDup) {
+        triggerAudioAlert('SHARE', 1);
+      } else {
+        console.log(`[Deduplicator] Blocking duplicate share play for user: ${data.uniqueId}`);
+      }
     });
 
     sse.addEventListener('subscribe', (e) => {
@@ -1417,36 +1793,83 @@ export default function App() {
       console.warn('[SSE ERROR] Connection status encountered error:', err);
       // Only reconnect if the user has NOT intentionally requested disconnection
       if (connectionStatusRef.current !== 'disconnected') {
-        setConnectionStatus('error');
-        setConnectionError('Conexión con el servidor interrumpida. Reconectando...');
-        
         // Ensure standard EventSource is closed so we can start fresh
         try { sse.close(); } catch (e) {}
 
-        const retryTimeout = setTimeout(() => {
-          if (connectionStatusRef.current !== 'disconnected') {
-            console.log('[SSE] Autoreconnect watchdog: attempting deep reconnection...');
-            handleConnectStream(targetUser, true);
-          }
-        }, 4000);
+        if (reconnectCountRef.current < 3) {
+          reconnectCountRef.current += 1;
+          setConnectionStatus('error');
+          setConnectionError(`Conexión con el servidor interrumpida. Reconectando (Intento ${reconnectCountRef.current}/3)...`);
+          
+          setTimeout(() => {
+            if (connectionStatusRef.current !== 'disconnected') {
+              console.log(`[SSE] Autoreconnect watchdog: attempting reconnection ${reconnectCountRef.current}/3...`);
+              handleConnectStream(targetUser, true);
+            }
+          }, 4000);
+        } else {
+          setConnectionStatus('error');
+          setConnectingPhase('none');
+          setConnectionError('⚠️ Conexión en vivo no disponible tras 3 intentos. El creador podría estar inactivo (offline), o TikTok tiene bloqueos temporales de IP. El Modo Simulación está disponible para realizar pruebas.');
+          appendSystemMessage('Sincronizador automático: Se alcanzaron los intentos máximos de reconexión. Conexión de live directa en pausa.');
+        }
       }
     };
   };
 
   // Continuous Connection Watchdog to ensure connection is maintained forever on PC/Live Stream setups
+  const checkConnection = () => {
+    // Only automatically re-establish if the connection was actively 'live' and got disrupted
+    // DO NOT loop on 'error' or 'connecting' states to prevent infinite spinning loops
+    if (connectionStatusRef.current === 'live') {
+      const activeUser = activeConnectedUser || username;
+      if (activeUser && (!sseRef.current || sseRef.current.readyState === EventSource.CLOSED)) {
+        console.log('[Connection Watchdog] Live connection lost (SSE closed). Reconnecting...');
+        appendSystemMessage('Sincronizador automático: Reestableciendo conexión permanente...');
+        handleConnectStream(activeUser, true);
+      }
+    }
+  };
+
   useEffect(() => {
-    const watchdogInterval = setInterval(() => {
-      if (connectionStatusRef.current === 'live' || connectionStatusRef.current === 'connecting' || connectionStatusRef.current === 'error') {
-        const activeUser = activeConnectedUser || username;
-        if (activeUser && (!sseRef.current || sseRef.current.readyState === EventSource.CLOSED)) {
-          console.log('[Connection Watchdog] Connection is supposed to be active, but SSE is inactive. Reconnecting...');
-          appendSystemMessage('Sincronizador automático: Reestableciendo conexión permanente...');
-          handleConnectStream(activeUser, true);
+    checkConnectionRef.current = checkConnection;
+  }, [activeConnectedUser, username]);
+
+  useEffect(() => {
+    const watchdogInterval = setInterval(checkConnection, 12000);
+
+    // Instant trigger when returning to app (changing apps or unlocking screen)
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        console.log('[Visibility] Tab returned to foreground. Performing direct active verification, recovering wake lock and audio priority...');
+        checkConnection();
+        // Unlock browser audio context to ensure alerts play properly
+        unlockAudio();
+        if (backgroundPriority) {
+          startBackgroundPriorityMode();
+        }
+        // Auto re-acquire wake lock if active previously
+        if (userWantsWakeLockRef.current && !wakeLockRef.current) {
+          console.log('[Visibility] Auto re-acquiring screen wake lock...');
+          requestWakeLock(true);
         }
       }
-    }, 12000);
-    return () => clearInterval(watchdogInterval);
-  }, [activeConnectedUser, username]);
+    };
+
+    const handleFocus = () => {
+      console.log('[Focus] Tab has focus. Checking connection health...');
+      checkConnection();
+    };
+
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    window.addEventListener('focus', handleFocus);
+
+    return () => {
+      clearInterval(watchdogInterval);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      window.removeEventListener('focus', handleFocus);
+    };
+  }, [backgroundPriority]);
 
   const handleDisconnect = async () => {
     setConnectingPhase('none');
@@ -1481,13 +1904,18 @@ export default function App() {
     pushEventToFeed(sysEvent);
   };
 
-  const requestWakeLock = async () => {
+  const requestWakeLock = async (isAutoRetry: boolean = false) => {
     if ('wakeLock' in navigator) {
       try {
         const lock = await (navigator as any).wakeLock.request('screen');
         wakeLockRef.current = lock;
         setWakeLockActive(true);
-        appendSystemMessage('📱 Pantalla siempre activa: ¡Activado con éxito! (Tu celular no se bloqueará ni atenuará la pantalla de este panel).');
+        if (!isAutoRetry) {
+          userWantsWakeLockRef.current = true;
+          appendSystemMessage('📱 Pantalla siempre activa: ¡Activado con éxito! (Tu celular no se bloqueará ni atenuará la pantalla de este panel).');
+        } else {
+          console.log('[WakeLock] Screen wake lock auto-recovered.');
+        }
         
         lock.addEventListener('release', () => {
           setWakeLockActive(false);
@@ -1496,12 +1924,13 @@ export default function App() {
       } catch (err) {
         console.warn('Fallo al activar Screen Wake Lock:', err);
       }
-    } else {
+    } else if (!isAutoRetry) {
       appendSystemMessage('Tu navegador o dispositivo no soporta el bloqueo de pantalla constante (Wake Lock API).');
     }
   };
 
   const releaseWakeLock = async () => {
+    userWantsWakeLockRef.current = false;
     if (wakeLockRef.current) {
       await wakeLockRef.current.release();
       wakeLockRef.current = null;
@@ -1557,7 +1986,7 @@ export default function App() {
       ];
       mockEvt.comment = comments[Math.floor(Math.random() * comments.length)];
       handleCheckSongCommand(mockEvt.comment, mockEvt.nickname || mockEvt.uniqueId, mockEvt.isModerator);
-      triggerChatTts(mockEvt.uniqueId, mockEvt.nickname || '', mockEvt.comment);
+      triggerChatTts(mockEvt.uniqueId, mockEvt.nickname || '', mockEvt.comment, false, mockEvt.id);
     } else if (type === 'like') {
       const add = Math.floor(1 + Math.random() * 25);
       mockEvt.like = {
@@ -1571,16 +2000,17 @@ export default function App() {
       const chosenGift = catalogGift 
         ? { 
             name: catalogGift.name, 
+            id: catalogGift.id,
             describe: `envió ${catalogGift.name} 🎁`, 
             pic: catalogGift.image, 
             diamonds: Math.floor(1 + Math.random() * 200) // assign dynamic diamonds count for custom gifts
           }
         : (() => {
             const defaultGifts = [
-              { name: 'Rose', describe: 'envió una Rosa 🌹', pic: 'https://p16-webcast.tiktokcdn.com/img/webcast/7408db06d445c9be6242699f8d51185d.png~tplv-obj.png', diamonds: 1 },
-              { name: 'TikTok', describe: 'envió Gift de TikTok ⚡', pic: 'https://p16-webcast.tiktokcdn.com/img/webcast/823a2cc74efb71889fc68a3560ec0cf7.png~tplv-obj.png', diamonds: 1 },
-              { name: 'Finger Heart', describe: 'envió un Corazón Coreano 🫰', pic: 'https://p16-webcast.tiktokcdn.com/img/webcast/919f18ed0f8b05afaf4528148e65893b.png~tplv-obj.png', diamonds: 5 },
-              { name: 'Lion', describe: 'envió un León Legendario 🦁', pic: 'https://p16-webcast.tiktokcdn.com/img/webcast/efc948e9cc3fe0710609b5cecf3f6ff3.png~tplv-obj.png', diamonds: 400 }
+              { name: 'Rose', id: 5655, describe: 'envió una Rosa 🌹', pic: 'https://p16-webcast.tiktokcdn.com/img/webcast/7408db06d445c9be6242699f8d51185d.png~tplv-obj.png', diamonds: 1 },
+              { name: 'TikTok', id: 5269, describe: 'envió Gift de TikTok ⚡', pic: 'https://p16-webcast.tiktokcdn.com/img/webcast/823a2cc74efb71889fc68a3560ec0cf7.png~tplv-obj.png', diamonds: 1 },
+              { name: 'Finger Heart', id: 5487, describe: 'envió un Corazón Coreano 🫰', pic: 'https://p16-webcast.tiktokcdn.com/img/webcast/919f18ed0f8b05afaf4528148e65893b.png~tplv-obj.png', diamonds: 5 },
+              { name: 'Lion', id: 6369, describe: 'envió un León Legendario 🦁', pic: 'https://p16-webcast.tiktokcdn.com/img/webcast/efc948e9cc3fe0710609b5cecf3f6ff3.png~tplv-obj.png', diamonds: 400 }
             ];
             return defaultGifts[Math.floor(Math.random() * defaultGifts.length)];
           })();
@@ -1588,7 +2018,7 @@ export default function App() {
       const repeat = Math.floor(1 + Math.random() * 5); // Simula envío repetitivo
 
       mockEvt.gift = {
-        giftId: Math.floor(1000 + Math.random() * 9000),
+        giftId: chosenGift.id || Math.floor(1000 + Math.random() * 9000),
         giftName: chosenGift.name,
         describe: chosenGift.describe,
         repeatCount: repeat,
@@ -1598,13 +2028,13 @@ export default function App() {
       };
 
       // Play Sound triggers & display graphics immediately
-      triggerAudioAlert(chosenGift.name, repeat);
+      triggerAudioAlert(chosenGift.name, repeat, mockEvt.gift.giftId);
       triggerGraphicsAlert(mockEvt);
 
       // Register simulated tool registry
       setDiscoveredGifts(prev => {
         if (!prev.some(x => x.giftName.toLowerCase() === chosenGift.name.toLowerCase())) {
-          return [...prev, { giftName: chosenGift.name, giftPictureUrl: chosenGift.pic, diamondCount: chosenGift.diamonds }];
+          return [...prev, { giftName: chosenGift.name, giftPictureUrl: chosenGift.pic, diamondCount: chosenGift.diamonds, giftId: mockEvt.gift.giftId }];
         }
         return prev;
       });
@@ -1614,6 +2044,17 @@ export default function App() {
     setViewerCount(prev => prev === 0 ? Math.floor(250 + Math.random() * 100) : prev + Math.floor(Math.random() * 5 - 2));
 
     pushEventToFeed(mockEvt);
+
+    // Broadcast mock event to active overlays connected on the server
+    fetch('/api/simulate-event', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        username: username || 'preview',
+        eventName: type,
+        payload: mockEvt
+      })
+    }).catch(e => console.warn('[OverlayBroadcast] Error:', e));
   };
 
   // Single helper to quickly copy OBS overlay URL
@@ -1626,32 +2067,29 @@ export default function App() {
     }, 2500);
   };
 
-  // Auto connect if OBS flags are set in Search Params, or auto-load configuration for saved user
+  // Helper to copy independent roulette-only OBS overlay URL
+  const copyRouletteOnlyLink = () => {
+    const obsUrl = `${window.location.protocol}//${window.location.host}/?username=${encodeURIComponent(username || 'preview')}&overlay=roulette`;
+    navigator.clipboard.writeText(obsUrl);
+    setCopiedRoulette(true);
+    setTimeout(() => {
+      setCopiedRoulette(false);
+    }, 2500);
+  };
+
+  // Auto connect if OBS flags are set in Search Params
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     const urlUser = params.get('username');
-    const overlayParam = params.get('overlay') === 'true';
+    const overlayParam = params.get('overlay') === 'true' || params.get('overlay') === 'roulette';
     setIsOverlayOnly(overlayParam);
+    setIsRouletteOnly(params.get('overlay') === 'roulette');
 
-    if (urlUser) {
+    if (overlayParam && urlUser) {
       setUsername(urlUser);
       handleConnectStream(urlUser);
-    } else {
-      const savedUser = localStorage.getItem('tiktok_creator_username');
-      if (savedUser) {
-        setUsername(savedUser);
-        loadUserConfig(savedUser);
-      }
     }
   }, []);
-
-  // Update saved user in local storage whenever it changes
-  useEffect(() => {
-    const cleanUser = username.replace('@', '').trim().toLowerCase();
-    if (cleanUser) {
-      localStorage.setItem('tiktok_creator_username', cleanUser);
-    }
-  }, [username]);
 
   const countActiveStreamSubscribers = () => {
     // Return dummy active status for display honesty
@@ -1666,6 +2104,8 @@ export default function App() {
           onFinishAlert={handleFinishAlert}
           activeSuperFanAlerts={activeSuperFanAlerts}
           onFinishSuperFanAlert={handleFinishSuperFanAlert}
+          rouletteChallenges={rouletteChallenges}
+          rouletteOnly={isRouletteOnly}
         />
       </div>
     );
@@ -1782,7 +2222,7 @@ export default function App() {
           
           {/* TikTok Live Link controller */}
           <section id="tiktok-link-section" className="bg-[#16161D] border border-white/10 rounded p-4 flex flex-col gap-3 shadow-md relative overflow-hidden">
-            <h2 className="text-[10px] font-bold text-gray-500 uppercase tracking-wider flex items-center gap-1.5">
+            <h2 className="text-[10px] font-bold text-gray-500 uppercase tracking-wider flex items-center gap-1.5 animate-fade-in">
               <Radio className="w-3.5 h-3.5 text-[#00f2ea]" />
               Sincronizar creador (TikTok LIVE)
             </h2>
@@ -1895,7 +2335,7 @@ export default function App() {
               </div>
             ) : (
               <>
-                <div className="flex gap-2">
+                <div className="flex gap-2 items-center">
                   <div className="relative flex-1">
                     <span className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-500 italic text-xs">@</span>
                     <input
@@ -1904,7 +2344,6 @@ export default function App() {
                       placeholder="usuario_creador"
                       value={username}
                       onChange={(e) => setUsername(e.target.value)}
-                      onBlur={(e) => loadUserConfig(e.target.value)}
                       disabled={(connectionStatus as string) === 'connecting' || connectionStatus === 'live'}
                       className="w-full bg-black/40 border border-white/10 rounded py-2 pl-7 pr-3 text-xs text-[#00f2ea] focus:outline-none focus:border-[#00f2ea]/50 font-mono disabled:opacity-45"
                     />
@@ -1914,7 +2353,7 @@ export default function App() {
                     <button
                       id="btn-disconnect"
                       onClick={handleDisconnect}
-                      className="bg-[#ff0050] hover:bg-[#ff0050]/90 text-white text-xs font-bold py-2 px-4 rounded transition-colors uppercase tracking-wider font-mono"
+                      className="bg-[#ff0050] hover:bg-[#ff0050]/90 text-white text-xs font-bold py-2 px-4 rounded transition-colors uppercase tracking-wider font-mono shrink-0"
                     >
                       Desvincular
                     </button>
@@ -1922,11 +2361,26 @@ export default function App() {
                     <button
                       id="btn-connect"
                       onClick={() => handleConnectStream()}
-                      className="bg-white hover:bg-gray-200 text-black text-xs font-bold py-2 px-4 rounded transition-colors uppercase tracking-wider font-mono"
+                      className="bg-white hover:bg-gray-200 text-black text-xs font-bold py-2 px-4 rounded transition-colors uppercase tracking-wider font-mono shrink-0"
                     >
                       Conectar
                     </button>
                   )}
+
+                  <button
+                    id="btn-cloud-autosave-toggle"
+                    type="button"
+                    onClick={handleToggleAutoSave}
+                    className={`p-2 rounded transition-all flex items-center justify-center border font-bold cursor-pointer shrink-0 ${
+                      autoSaveActive 
+                        ? 'bg-green-500/15 border-green-500/40 text-green-400 hover:bg-green-500/25 active:scale-95' 
+                        : 'bg-white/5 border-white/10 text-gray-400 hover:text-white hover:border-white/30 active:scale-95'
+                    }`}
+                    title={autoSaveActive ? "Sincronización en la nube activa (✓, Guardando en tiempo real)" : "Activar Sincronización en la nube (✓)"}
+                  >
+                    <CheckCircle className={`w-4 h-4 transition-transform ${autoSaveActive ? 'scale-110 text-green-400 animate-pulse font-extrabold' : 'opacity-65'}`} />
+                    {autoSaveActive && <span className="ml-1 text-[11px] text-green-400 font-extrabold font-mono">✓</span>}
+                  </button>
                 </div>
 
                 {/* Premium Connection block - directly visible to the user */}
@@ -2031,7 +2485,6 @@ export default function App() {
                     key={s_ch.user}
                     onClick={() => {
                       setUsername(s_ch.user);
-                      loadUserConfig(s_ch.user);
                     }}
                     disabled={connectionStatus === 'connecting' || connectionStatus === 'live'}
                     className="p-1 px-2 text-left bg-black/40 hover:bg-[#00f2ea]/15 hover:border-[#00f2ea]/40 border border-white/5 rounded text-left transition-all disabled:opacity-45 disabled:pointer-events-none group"
@@ -2123,138 +2576,16 @@ export default function App() {
             )}
           </section>
 
-          {/* Gestor de Copias de Seguridad y Perfiles */}
-          <section id="profile-manager-section" className="bg-[#16161D] border border-white/10 rounded p-4 flex flex-col gap-3 shadow-md relative overflow-hidden">
-            <h2 className="text-[10px] font-bold text-gray-500 uppercase tracking-wider flex items-center gap-1.5">
+          {/* Copias de Seguridad */}
+          <section id="backup-manager-section" className="bg-[#121218] border border-white/5 rounded p-4 flex flex-col gap-3 shadow-md relative overflow-hidden">
+            <h2 className="text-[10px] font-bold text-gray-400 uppercase tracking-wider flex items-center gap-1.5">
               <FolderSync className="w-3.5 h-3.5 text-[#00f2ea]" />
-              Gestor de Copias y Perfiles En la Nube
+              Copias de Seguridad
             </h2>
 
-            <p className="text-gray-400 text-[10.5px] leading-relaxed">
-              Tus asignaciones de sonidos, superfans y configuración de voz se guardan <strong>automáticamente en tu navegador</strong> y se sincronizan en la nube al ingresar un usuario de TikTok.
+            <p className="text-gray-450 text-[10.5px] leading-relaxed">
+              Descarga o importa tus asignaciones de sonidos, lista de superfans y configuración de voz mediante archivos JSON compactos.
             </p>
-
-            {/* Recent profiles quick loader */}
-            {recentProfiles.length > 0 && (
-              <div className="flex flex-col gap-1.5 border-b border-white/5 pb-3">
-                <span className="text-[9.5px] text-gray-400 font-bold uppercase tracking-wider flex items-center gap-1">
-                  <History className="w-3 h-3 text-[#00f2ea]" />
-                  Carga rápida de perfiles guardados:
-                </span>
-                <div className="flex flex-wrap gap-1.5 max-h-[110px] overflow-y-auto pr-1">
-                  {recentProfiles.map(prof => (
-                    <div key={prof} className="inline-flex items-center gap-1.5 bg-black/40 border border-white/5 rounded pl-2.5 pr-1 py-1 text-[11px] hover:border-[#00f2ea]/30 transition-all">
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setUsername(prof);
-                          loadUserConfig(prof);
-                        }}
-                        className="font-mono text-gray-300 hover:text-[#00f2ea] text-xs font-semibold hover:underline bg-transparent border-none p-0 cursor-pointer"
-                        title={`Cargar configuraciones de @${prof}`}
-                      >
-                        @{prof}
-                      </button>
-                      <div className="w-[1px] h-3 bg-white/10"></div>
-                      <button
-                        type="button"
-                        onClick={() => {
-                          const filtered = recentProfiles.filter(p => p !== prof);
-                          setRecentProfiles(filtered);
-                          localStorage.setItem('tiktok_recent_profiles_list', JSON.stringify(filtered));
-                        }}
-                        className="text-gray-500 hover:text-[#ff0050] bg-transparent border-none p-0.5 cursor-pointer leading-none"
-                        title="Eliminar perfil del historial de accesos"
-                      >
-                        <Trash2 className="w-3 h-3" />
-                      </button>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
-
-            {/* Cloud connection controllers */}
-            <div className="flex flex-col gap-2 bg-black/35 p-2.5 rounded border border-white/5 mt-0.5">
-              <span className="text-[9.5px] text-gray-400 font-bold uppercase tracking-widest block font-mono">
-                Sincronización en la Nube
-              </span>
-
-              {username.trim() ? (
-                <div className="flex items-center justify-between text-[11px] gap-2">
-                  <span className="font-mono text-white truncate flex-1">
-                    Perfil: <strong className="text-[#00f2ea]">@{username.replace('@','')}</strong>
-                  </span>
-                  <div className="flex gap-1.5 shrink-0">
-                    <button
-                      type="button"
-                      disabled={cloudLoadStatus === 'loading'}
-                      onClick={() => loadUserConfig(username, true)}
-                      className={`px-3 py-1.5 rounded text-[10px] font-bold flex items-center gap-1 transition-all cursor-pointer ${
-                        cloudLoadStatus === 'loading'
-                          ? 'bg-yellow-500/20 text-yellow-400 border border-yellow-500/30 animate-pulse'
-                          : cloudLoadStatus === 'loaded'
-                          ? 'bg-green-500/20 text-green-400 border border-green-500/30'
-                          : cloudLoadStatus === 'error'
-                          ? 'bg-red-500/20 text-red-400 border border-red-500/30'
-                          : 'bg-white/5 hover:bg-white/10 text-white border border-white/10'
-                      }`}
-                      title="Forzar descarga del perfil de la nube"
-                    >
-                      <RefreshCw className={`w-2.5 h-2.5 ${cloudLoadStatus === 'loading' ? 'animate-spin' : ''}`} />
-                      {cloudLoadStatus === 'loading' ? 'Descargando...' : cloudLoadStatus === 'loaded' ? '¡Descargado!' : cloudLoadStatus === 'error' ? 'Error' : 'Descargar'}
-                    </button>
-
-                    <button
-                      id="btn-save-cloud"
-                      type="button"
-                      disabled={cloudStatus === 'saving'}
-                      onClick={() => saveConfigToServer(username, true)}
-                      className={`px-3 py-1.5 rounded text-[10px] font-bold flex items-center gap-1 transition-all cursor-pointer ${
-                        cloudStatus === 'saving' 
-                          ? 'bg-yellow-500/20 text-yellow-400 border border-yellow-500/30 animate-pulse' 
-                          : cloudStatus === 'saved'
-                          ? 'bg-green-500/20 text-green-400 border border-green-500/30'
-                          : cloudStatus === 'error'
-                          ? 'bg-red-500/20 text-red-400 border border-red-500/30'
-                          : 'bg-[#00f2ea]/20 hover:bg-[#00f2ea]/30 text-[#00f2ea] border border-[#00f2ea]/30'
-                      }`}
-                      title="Guardar toda la configuración de sonidos, superfans y TTS directamente en la Nube"
-                    >
-                      <Save className={`w-3 h-3 ${cloudStatus === 'saving' ? 'animate-spin' : ''}`} />
-                      {cloudStatus === 'saving' ? 'Guardando...' : cloudStatus === 'saved' ? '¡Guardado!' : cloudStatus === 'error' ? 'Error' : 'Guardar en la Nube'}
-                    </button>
-                  </div>
-                </div>
-              ) : (
-                <p className="text-[10px] text-yellow-400 font-mono">
-                  ⚠ Ingresa un usuario de TikTok arriba para activar la nube.
-                </p>
-              )}
-
-              {firestoreQuotaExceeded && (
-                <div id="firestore-quota-alert" className="mt-2 p-2 bg-yellow-500/10 border border-yellow-500/30 rounded text-[10px] text-gray-300 leading-normal flex flex-col gap-1.5 animate-fade-in">
-                  <div className="flex items-center gap-1.5 text-yellow-400 font-bold font-mono">
-                    <AlertCircle className="w-3 h-3 shrink-0" />
-                    <span>LÍMITE DIARIO DE BASE DE DATOS ALCANZADO</span>
-                  </div>
-                  <p>
-                    La cuota gratuita de la base de datos de persistencia en la nube se ha agotado por hoy.
-                  </p>
-                  <p className="text-gray-400">
-                    <strong>¡No te preocupes!</strong> Tus cambios se han guardado con éxito localmente en tu navegador y en nuestro servidor secundario de respaldo. Todo seguirá funcionando perfectamente.
-                  </p>
-                  <a
-                    href="https://console.firebase.google.com/project/gen-lang-client-0436087868/firestore/databases/ai-studio-ee8081bc-75f8-4b7e-aa62-dd9a1a3831db/data?openUpgradeDialog=true"
-                    target="_blank"
-                    rel="noreferrer"
-                    className="text-[#00f2ea] hover:underline font-bold mt-1 text-center font-mono"
-                  >
-                    Ver panel de cuotas de Firebase &rarr;
-                  </a>
-                </div>
-              )}
-            </div>
 
             {/* Import / Export JSON Files */}
             <div className="grid grid-cols-2 gap-2 mt-1">
@@ -2302,6 +2633,312 @@ export default function App() {
             superFanWelcomeEnabled={superFanWelcomeEnabled}
             onToggleSuperFanWelcome={handleToggleSuperFanWelcome}
           />
+
+          {/* CONFIGURACIÓN DE LA RULETA DE RETOS */}
+          <section id="roulette-config-section" className="bg-[#121218] border border-white/5 rounded p-4 flex flex-col gap-3 shadow-md relative overflow-hidden">
+            <div className="flex items-center justify-between">
+              <h2 className="text-[10px] font-bold text-gray-400 uppercase tracking-wider flex items-center gap-1.5">
+                <span className="text-sm">🎰</span>
+                Ruleta de Retos (OBS)
+              </h2>
+              <span className="text-[9px] bg-amber-500/10 border border-amber-500/25 text-amber-400 font-mono px-1.5 py-0.2 rounded uppercase select-none animate-pulse">
+                Nuevo
+              </span>
+            </div>
+
+            <p className="text-gray-455 text-[10px] leading-relaxed">
+              Configura los retos o desafíos aleatorios que aparecerán en la ruleta del overlay de OBS cuando tus espectadores te envíen regalos mapeados con el activador de ruleta.
+            </p>
+
+            <div className="flex flex-col gap-2 bg-black/30 border border-white/5 p-2 rounded">
+              <div className="flex items-center justify-between">
+                <span className="text-[10px] text-gray-300 font-bold uppercase select-none">
+                  Estado de la Ruleta
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setRouletteEnabled(!rouletteEnabled)}
+                  className={`px-2 py-1 text-[9.5px] font-mono rounded uppercase tracking-wide transition-all ${
+                    rouletteEnabled 
+                      ? 'bg-amber-500/20 border border-amber-500/50 text-amber-400 font-bold' 
+                      : 'bg-black/50 border border-white/10 text-gray-400 hover:text-white'
+                  }`}
+                >
+                  {rouletteEnabled ? '🟢 ACTIVADO' : '🔴 DESACTIVADO'}
+                </button>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  if (!rouletteEnabled) {
+                    alert("⚠️ ¡Activa el Estado de la Ruleta primero para verla girar!");
+                    return;
+                  }
+                  const sampleEvt = {
+                    id: `test-roulette-${Date.now()}-${Math.random()}`,
+                    type: 'gift' as const,
+                    timestamp: Date.now(),
+                    uniqueId: 'probador_ruleta',
+                    nickname: 'Probar Ruleta',
+                    profilePictureUrl: 'https://p16-sign-va.tiktokcdn.com/tos-malisg-avt-0068/7313894468205428741~c5_100x100.jpeg?biz_tag=tiktok_user_cover',
+                    gift: {
+                      giftId: 14488, 
+                      giftName: 'Capybara',
+                      describe: 'envió Capybara (Probando Ruleta) 🎰',
+                      repeatCount: 1,
+                      repeatEnd: true,
+                      giftPictureUrl: 'https://p16-webcast.tiktokcdn.com/img/alisg/webcast-sg/resource/6703facdac34caefbd0617a6321afe9b.png~tplv-obj.webp',
+                      diamondCount: 10
+                    }
+                  };
+                  triggerAudioAlert('Capybara', 1, 14488);
+                  triggerGraphicsAlert(sampleEvt);
+
+                  // Broadcast roulette test event to the server's SSE so it triggers in the independent OBS window
+                  fetch('/api/simulate-event', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                      username: username || 'preview',
+                      eventName: 'gift',
+                      payload: sampleEvt
+                    })
+                  }).catch(e => console.warn('[RouletteBroadcast] Error:', e));
+                }}
+                className="w-full bg-amber-500/10 hover:bg-amber-500/20 border border-amber-500/30 text-amber-400 font-bold font-mono text-[9.5px] py-1 rounded uppercase tracking-wider transition-all flex items-center justify-center gap-1 cursor-pointer"
+              >
+                <span>🎰</span> Probar Ruleta en Overlay/Pantalla
+              </button>
+            </div>
+
+            {/* CONFIGURACIÓN DEL REGALO ACTIVADOR */}
+            <div className="bg-black/25 border border-white/5 rounded p-2.5 flex flex-col gap-2">
+              <span className="text-[10px] text-amber-450 font-bold uppercase tracking-wider flex items-center gap-1 select-none">
+                <span>🎁</span> Regalos que activan la Ruleta
+              </span>
+              
+              <div className="flex flex-wrap gap-1.5 max-h-[100px] overflow-y-auto p-1.5 bg-black/40 rounded border border-white/5">
+                {mappings.filter(m => m.triggerRoulette).map(m => (
+                  <div key={m.giftName} className="flex items-center gap-1.5 bg-amber-500/10 border border-amber-500/30 text-amber-300 text-[10px] px-1.5 py-0.5 rounded font-medium">
+                    {m.iconUrl && (
+                      <img 
+                        src={m.iconUrl.startsWith('data:') ? m.iconUrl : `/api/proxy-image?url=${encodeURIComponent(m.iconUrl)}`} 
+                        alt={m.giftName} 
+                        className="w-3.5 h-3.5 object-contain"
+                        referrerPolicy="no-referrer"
+                      />
+                    )}
+                    <span>{m.giftName}</span>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const updated = mappings.map(item => {
+                          if (item.giftName === m.giftName) {
+                            return { ...item, triggerRoulette: false };
+                          }
+                          return item;
+                        });
+                        handleUpdateMappings(updated);
+                      }}
+                      className="ml-1 text-red-400 hover:text-red-300 font-bold text-[8px] uppercase font-mono cursor-pointer"
+                      title="Quitar de activadores de ruleta"
+                    >
+                      ✕
+                    </button>
+                  </div>
+                ))}
+                {mappings.filter(m => m.triggerRoulette).length === 0 && (
+                  <span className="text-[9.5px] text-gray-500 italic p-1">No hay regalos configurados para activar la ruleta. Selecciona uno abajo.</span>
+                )}
+              </div>
+
+              <div className="flex gap-1.5 items-center mt-1">
+                <select
+                  id="select-roulette-trigger-gift"
+                  className="flex-1 bg-black/60 border border-white/10 rounded px-2 py-1 text-[11px] text-white focus:outline-none"
+                  defaultValue=""
+                >
+                  <option value="" disabled>Seleccionar Regalo Mapeado...</option>
+                  {mappings.filter(m => !m.triggerRoulette).map(m => (
+                    <option key={m.giftName} value={m.giftName}>
+                      🎁 {m.giftName} {m.giftId ? `(ID: ${m.giftId})` : ''}
+                    </option>
+                  ))}
+                </select>
+                <button
+                  type="button"
+                  onClick={() => {
+                    const selectEl = document.getElementById('select-roulette-trigger-gift') as HTMLSelectElement;
+                    const selectedGift = selectEl?.value;
+                    if (!selectedGift) return;
+                    
+                    const updated = mappings.map(m => {
+                      if (m.giftName === selectedGift) {
+                        return { ...m, triggerRoulette: true };
+                      }
+                      return m;
+                    });
+                    handleUpdateMappings(updated);
+                    selectEl.value = ""; // reset dropdown selection
+                  }}
+                  className="bg-amber-500/10 border border-amber-500/30 hover:bg-amber-500/20 text-amber-400 font-bold text-[9.5px] px-3.5 py-1.5 rounded uppercase tracking-wider transition-all cursor-pointer"
+                >
+                  Agregar
+                </button>
+              </div>
+            </div>
+
+            {/* Input to insert custom challenges */}
+            <form 
+              onSubmit={(e) => {
+                e.preventDefault();
+                const text = (e.currentTarget.elements.namedItem('new_challenge') as HTMLInputElement)?.value?.trim();
+                if (!text) return;
+                if (rouletteChallenges.length >= 16) {
+                  alert("⚠️ Se recomienda un máximo de 16 opciones para una ruleta legible.");
+                }
+                setRouletteChallenges(prev => {
+                  if (prev.includes(text)) {
+                    alert("⚠️ Este reto ya está agregado en la ruleta.");
+                    return prev;
+                  }
+                  return [...prev, text];
+                });
+                (e.currentTarget.elements.namedItem('new_challenge') as HTMLInputElement).value = "";
+              }}
+              className="flex gap-1.5 mt-1"
+            >
+              <input
+                id="obs-new-challenge-input"
+                name="new_challenge"
+                type="text"
+                placeholder="Ej: Comer un limón 🍋..."
+                maxLength={45}
+                className="flex-1 bg-black/60 border border-white/10 rounded py-1 px-2 text-xs text-white focus:outline-none focus:border-amber-400/45"
+              />
+              <button
+                type="submit"
+                className="bg-amber-500 hover:bg-amber-600 active:scale-95 text-black font-black text-xs px-3 rounded flex items-center justify-center transition-all cursor-pointer"
+              >
+                Agregar
+              </button>
+            </form>
+
+            {/* Scrollable listing */}
+            <div className="flex flex-col gap-1 mt-1 max-h-[180px] overflow-y-auto pr-1">
+              {rouletteChallenges.length === 0 ? (
+                <div className="text-center py-4 bg-black/20 border border-dashed border-white/5 rounded text-[10px] text-gray-500 uppercase font-mono">
+                  No hay retos configurados. Agrega uno arriba.
+                </div>
+              ) : (
+                rouletteChallenges.map((challenge, idx) => (
+                  <div key={idx}>
+                    {editingChallengeIndex === idx ? (
+                      <form
+                        onSubmit={(e) => {
+                          e.preventDefault();
+                          const val = editingChallengeText.trim();
+                          if (!val) return;
+                          setRouletteChallenges(prev => {
+                            const copy = [...prev];
+                            copy[idx] = val;
+                            return copy;
+                          });
+                          setEditingChallengeIndex(null);
+                        }}
+                        className="flex items-center gap-1.5 w-full bg-black/50 border border-amber-500/30 p-1 rounded"
+                      >
+                        <span className="text-amber-400 font-mono text-[10px] pl-1 select-none shrink-0">#{idx + 1}</span>
+                        <input
+                          type="text"
+                          value={editingChallengeText}
+                          onChange={(e) => setEditingChallengeText(e.target.value)}
+                          maxLength={45}
+                          className="flex-1 bg-black text-xs text-white border border-white/10 rounded px-1.5 py-0.5 focus:outline-none focus:border-amber-400"
+                          autoFocus
+                          onKeyDown={(e) => {
+                            if (e.key === 'Escape') setEditingChallengeIndex(null);
+                          }}
+                        />
+                        <button
+                          type="submit"
+                          className="p-1 rounded bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 hover:bg-emerald-500/35 transition-all cursor-pointer shrink-0"
+                          title="Guardar"
+                        >
+                          <Check className="w-3 h-3" />
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setEditingChallengeIndex(null)}
+                          className="p-1 rounded bg-red-500/10 text-red-400 border border-red-500/20 hover:bg-red-500/25 transition-all text-[9px] px-1.5 uppercase font-bold shrink-0 cursor-pointer"
+                          title="Cancelar"
+                        >
+                          Esc
+                        </button>
+                      </form>
+                    ) : (
+                      <div className="flex items-center justify-between bg-black/35 border border-white/5 hover:border-white/10 p-1 pl-2 rounded transition-all text-left group">
+                        <span className="text-[11px] text-gray-350 font-sans truncate pr-2 flex-1">
+                          <strong className="text-amber-400 font-mono text-[10px] mr-1.5">#{idx + 1}</strong>
+                          {challenge}
+                        </span>
+                        <div className="flex items-center gap-1 shrink-0">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setEditingChallengeIndex(idx);
+                              setEditingChallengeText(challenge);
+                            }}
+                            className="p-1 rounded text-gray-500 hover:text-amber-400 hover:bg-amber-500/10 transition-colors cursor-pointer"
+                            title="Editar reto"
+                          >
+                            <Edit2 className="w-3 h-3" />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setRouletteChallenges(prev => prev.filter((_, i) => i !== idx))}
+                            className="p-1 rounded text-gray-500 hover:text-red-400 hover:bg-red-500/10 transition-colors cursor-pointer"
+                            title="Eliminar reto"
+                          >
+                            <Trash2 className="w-3 h-3" />
+                          </button>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                ))
+              )}
+            </div>
+
+            {/* Bottom Actions: Presets and Resets */}
+            {rouletteChallenges.length > 0 && (
+              <div className="flex items-center justify-between mt-1 border-t border-white/5 pt-2">
+                <span className="text-[9px] text-gray-500 font-mono uppercase">
+                  Total de opciones: {rouletteChallenges.length}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (window.confirm("¿Seguro que deseas restaurar los retos originales por defecto de la ruleta?")) {
+                      setRouletteChallenges([
+                        "Hacer 5 lagartijas 🏋️",
+                        "Trompa de elefante por 15s 🐘",
+                        "Plancha abdominal por 30s ⏱️",
+                        "Contar un chiste malo 😅",
+                        "Cantar una canción a capela 🎤",
+                        "Hacer mímica de un animal 🦁",
+                        "Beber un vaso de agua completo 🥛",
+                        "Decir un trabalenguas rápido 🗣️"
+                      ]);
+                    }
+                  }}
+                  className="text-[9px] text-amber-500/75 hover:text-amber-400 hover:underline font-bold uppercase transition-colors"
+                >
+                  Restaurar Originales
+                </button>
+              </div>
+            )}
+          </section>
 
           {/* Offline Sandbox Simulator Console */}
           <section id="simulator-console-section" className="bg-[#16161D] border border-white/10 rounded p-4 flex flex-col gap-3">
@@ -2473,7 +3110,7 @@ export default function App() {
                       profilePictureUrl: sf.avatarUrl
                     };
                     setEvents(prev => [...prev.slice(-149), mockEvt]);
-                    triggerChatTts(sf.uniqueId, sf.nickname || '', commentText);
+                    triggerChatTts(sf.uniqueId, sf.nickname || '', commentText, false, mockEvt.id);
                   }}
                   className="bg-black/35 border border-amber-500/30 hover:border-amber-400 text-amber-500 hover:text-amber-400 rounded p-2 text-xs font-bold transition-all flex items-center justify-center gap-1.5"
                   title="Simula un comentario de chat enviado por un súper fan"
@@ -2493,23 +3130,49 @@ export default function App() {
               <FolderSync className="w-3.5 h-3.5 text-[#ff0050]" />
               Integración con OBS Studio
             </h2>
-            <p className="text-[10px] text-gray-500 leading-relaxed font-sans">
-              Para reproducir alertas y sonidos transparentes directamente sobre tu directo en OBS Studio, utiliza la Fuente de Navegador (Browser Source). Size: 1920x1080.
+            <p className="text-[10px] text-gray-400 leading-relaxed font-sans">
+              Utiliza la Fuente de Navegador (Browser Source) en tu software de transmisión (OBS Studio) configurando una resolución de <strong className="text-white">1920x1080</strong>.
             </p>
 
-            <button
-              id="btn-copy-obs-url"
-              onClick={copyOverlayLink}
-              type="button"
-              className={`mt-1 border font-bold text-xs uppercase tracking-wider rounded py-2 transition-all duration-200 flex items-center justify-center gap-1.5 ${
-                copiedObs 
-                  ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-400' 
-                  : 'border-white/20 hover:bg-white/5 bg-transparent text-white'
-              }`}
-            >
-              <Copy className="w-3.5 h-3.5" />
-              {copiedObs ? '¡Copiado con Éxito!' : 'Copiar Enlace'}
-            </button>
+            <div className="flex flex-col gap-2.5 mt-1">
+              <div>
+                <span className="text-[9px] text-gray-500 font-bold uppercase block mb-1">
+                  Enlace General (Alertas + Música + Ruleta)
+                </span>
+                <button
+                  id="btn-copy-obs-url"
+                  onClick={copyOverlayLink}
+                  type="button"
+                  className={`w-full border font-bold text-[11px] uppercase tracking-wider rounded py-2 transition-all duration-200 flex items-center justify-center gap-1.5 cursor-pointer ${
+                    copiedObs 
+                      ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-400' 
+                      : 'border-white/20 hover:bg-white/5 bg-transparent text-white'
+                  }`}
+                >
+                  <Copy className="w-3.5 h-3.5" />
+                  {copiedObs ? '¡Copiado con Éxito!' : 'Copiar Enlace General'}
+                </button>
+              </div>
+
+              <div className="border-t border-white/5 pt-2">
+                <span className="text-[9px] text-[#00f2ea]/80 font-bold uppercase flex items-center gap-1 mb-1">
+                  <span>🎰</span> Overlay Independiente (Solo la Ruleta)
+                </span>
+                <button
+                  id="btn-copy-obs-roulette-url"
+                  onClick={copyRouletteOnlyLink}
+                  type="button"
+                  className={`w-full border font-bold text-[11px] uppercase tracking-wider rounded py-2 transition-all duration-200 flex items-center justify-center gap-1.5 cursor-pointer ${
+                    copiedRoulette 
+                      ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-400' 
+                      : 'border-[#00f2ea]/30 bg-[#00f2ea]/5 hover:bg-[#00f2ea]/10 text-white'
+                  }`}
+                >
+                  <Copy className="w-3.5 h-3.5" />
+                  {copiedRoulette ? '¡Copiado con Éxito!' : 'Copiar Enlace de Ruleta'}
+                </button>
+              </div>
+            </div>
           </section>
 
         </div>
@@ -2518,7 +3181,7 @@ export default function App() {
         <div className="lg:col-span-8 grid grid-cols-1 md:grid-cols-12 gap-6">
           
           {/* Sounds assignments configuration dashboard client */}
-          <div className="md:col-span-6 flex flex-col">
+          <div className="md:col-span-6 flex flex-col relative">
             <GiftSoundConfig 
               mappings={mappings}
               presetSounds={PRESET_SOUNDS}
@@ -2562,6 +3225,7 @@ export default function App() {
                 triggerGraphicsAlert(sampleEvt);
               }}
             />
+
           </div>
 
           {/* Interactive streaming transaction logs logs feed */}

@@ -30,6 +30,7 @@ export interface GiftSoundMapping {
   volume: number; // 0 to 1
   label: string; // Display name
   customSoundUrl?: string; // Uploaded/pasted URL
+  triggerRoulette?: boolean; // Toggles if this gift triggers the OBS challenge roulette
 }
 
 export interface PresetSound {

@@ -251,8 +251,13 @@ export default function LiveEventFeed({ events, onClearEvents, superFans = [] }:
                           <p className="text-white font-bold text-[11px]">
                             {evt.gift.describe} <span className="text-[#ff0050] font-mono font-bold text-xs bg-[#ff0050]/10 px-1 rounded ml-1">x{evt.gift.repeatCount}</span>
                           </p>
-                          <p className="text-[9px] text-yellow-500 font-mono">
-                            💎 {evt.gift.diamondCount} diamantes
+                          <p className="text-[9px] text-yellow-500 font-mono flex items-center gap-2 mt-0.5">
+                            <span>💎 {evt.gift.diamondCount} diamantes</span>
+                            {evt.gift.giftId && (
+                              <span className="text-[#00f2ea] bg-[#00f2ea]/10 border border-[#00f2ea]/25 px-1 rounded text-[8.5px] font-sans font-bold">
+                                ID: {evt.gift.giftId}
+                              </span>
+                            )}
                           </p>
                         </div>
                       </div>

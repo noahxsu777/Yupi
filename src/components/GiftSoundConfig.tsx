@@ -414,6 +414,14 @@ export default function GiftSoundConfig({
       return;
     }
 
+    // Look up in GIFT_CATALOG for auto ID & Icon matching
+    const catalogMatch = GIFT_CATALOG.find(
+      g => g.name.toLowerCase() === cleanName.toLowerCase()
+    );
+
+    const detectedId = catalogMatch ? catalogMatch.id : undefined;
+    const detectedIcon = catalogMatch ? catalogMatch.image : undefined;
+
     let soundIdToUse = newSoundId;
     let customSoundUrlToUse: string | undefined = undefined;
 
@@ -431,9 +439,11 @@ export default function GiftSoundConfig({
 
     const newMap: GiftSoundMapping = {
       giftName: cleanName,
+      giftId: detectedId,
       soundId: soundIdToUse,
       volume: newVolume,
       label: cleanName,
+      iconUrl: detectedIcon || (window as any).tempUploadedIcon,
       customSoundUrl: customSoundUrlToUse,
     };
 
@@ -569,15 +579,26 @@ export default function GiftSoundConfig({
   };
 
   // Quick import from catalog list or discovered list
-  const handleImportGift = (gift: { giftName: string; giftPictureUrl: string; diamondCount?: number }) => {
+  const handleImportGift = (gift: { giftName: string; giftPictureUrl: string; giftId?: number | string; diamondCount?: number }) => {
     if (mappings.some(m => m.giftName.toLowerCase() === gift.giftName.toLowerCase())) {
-      handleChangeMappingProp(gift.giftName, 'iconUrl', gift.giftPictureUrl);
+      const updated = mappings.map(m => {
+        if (m.giftName.toLowerCase() === gift.giftName.toLowerCase()) {
+          return {
+            ...m,
+            iconUrl: gift.giftPictureUrl,
+            giftId: gift.giftId || m.giftId
+          };
+        }
+        return m;
+      });
+      onUpdateMapping(updated);
       setActiveTab('mappings');
       return;
     }
 
     const newMap: GiftSoundMapping = {
       giftName: gift.giftName,
+      giftId: gift.giftId,
       soundId: 'magic',
       volume: 0.8,
       label: gift.giftName,
@@ -815,12 +836,34 @@ export default function GiftSoundConfig({
                             </div>
                           </div>
                           <div>
-                            <div className="font-sans text-xs font-semibold text-white">
-                              {mapping.giftName}
+                            <div className="font-sans text-xs font-semibold text-white flex items-center gap-1.5 flex-wrap">
+                              <span>{mapping.giftName}</span>
+                              {mapping.giftId && (
+                                <span className="text-[9px] font-mono font-bold text-[#00f2ea] bg-[#00f2ea]/10 border border-[#00f2ea]/20 px-1 rounded">
+                                  ID: {mapping.giftId}
+                                </span>
+                              )}
                             </div>
-                            <div className="text-[10px] text-[#ff0050] font-mono font-bold flex items-center gap-1 uppercase tracking-tighter">
-                              <Volume2 className="w-3 h-3 text-[#ff0050]" />
-                              Vol: {Math.round(mapping.volume * 100)}%
+                            <div className="flex items-center gap-2 mt-0.5">
+                              <div className="text-[10px] text-[#ff0050] font-mono font-bold flex items-center gap-1 uppercase tracking-tighter">
+                                <Volume2 className="w-3 h-3 text-[#ff0050]" />
+                                Vol: {Math.round(mapping.volume * 100)}%
+                              </div>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  const currentId = mapping.giftId ? String(mapping.giftId) : "";
+                                  const newId = prompt(`Ingresa el nuevo ID real de TikTok para el regalo "${mapping.giftName}":\n(Ej: Capybara es 14488, Rosa es 5655)`, currentId);
+                                  if (newId !== null) {
+                                    handleChangeMappingProp(mapping.giftName, 'giftId', newId.trim());
+                                    showStatus(`¡ID de regalo actualizado a ${newId.trim() || 'Ninguno'} con éxito!`, 'success');
+                                  }
+                                }}
+                                className="text-[9px] text-gray-500 hover:text-white underline font-mono cursor-pointer transition-colors"
+                                title="Hacer clic para ingresar o modificar el ID numérico real de este regalo en TikTok"
+                              >
+                                [Editar ID]
+                              </button>
                             </div>
                           </div>
                         </div>
@@ -924,6 +967,25 @@ export default function GiftSoundConfig({
                           >
                             <Search className="w-3 h-3" />
                             Buscar
+                          </button>
+
+                          {/* Roulette Trigger Toggle */}
+                          <button
+                            type="button"
+                            onClick={() => {
+                              const nextVal = !mapping.triggerRoulette;
+                              handleChangeMappingProp(mapping.giftName, 'triggerRoulette', nextVal);
+                              showStatus(`¡Ruleta ${nextVal ? 'ACTIVADA' : 'DESACTIVADA'} para el regalo: ${mapping.giftName}!`, 'success');
+                            }}
+                            className={`p-1 px-2 border rounded text-[10px] font-bold uppercase transition-all flex items-center gap-1 shrink-0 cursor-pointer ${
+                              mapping.triggerRoulette
+                                ? 'bg-amber-500/10 border-amber-500/50 text-amber-400 hover:bg-amber-500/20'
+                                : 'bg-[#16161D] border-white/10 text-gray-400 hover:text-amber-400 hover:border-amber-400/50'
+                            }`}
+                            title="Haz que este regalo active la Ruleta de Retos (desafíos aleatorios en OBS)"
+                          >
+                            <span className="shrink-0 text-xs">🎰</span>
+                            {mapping.triggerRoulette ? 'Ruleta: Sí' : 'Ruleta: No'}
                           </button>
 
                           {/* Custom upload button if 'custom' is selected */}
@@ -1434,7 +1496,7 @@ export default function GiftSoundConfig({
                       </div>
 
                       <button
-                        onClick={() => handleImportGift({ giftName: gift.giftName, giftPictureUrl: gift.giftPictureUrl })}
+                        onClick={() => handleImportGift({ giftName: gift.giftName, giftPictureUrl: gift.giftPictureUrl, giftId: (gift as any).giftId })}
                         className={`text-[9.5px] font-bold py-1 px-2 rounded uppercase tracking-wider transition-all ${
                           isMapped
                             ? 'bg-black/30 text-gray-500 border border-white/5 cursor-default'
@@ -1530,7 +1592,7 @@ export default function GiftSoundConfig({
                         </div>
 
                         <button
-                          onClick={() => handleImportGift({ giftName: gift.name, giftPictureUrl: gift.image })}
+                          onClick={() => handleImportGift({ giftName: gift.name, giftPictureUrl: gift.image, giftId: gift.id })}
                           className={`text-[9px] font-bold py-1 px-1.5 rounded uppercase tracking-wider transition-all shrink-0 ${
                             isMapped
                               ? 'bg-[#00f2ea]/15 text-[#00f2ea] border border-[#00f2ea]/20 focus:outline-none'

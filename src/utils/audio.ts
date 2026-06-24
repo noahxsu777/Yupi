@@ -34,12 +34,35 @@ export async function resolveSoundUrl(url: string): Promise<string> {
 // Web Audio API Synthesizer and custom Player
 let audioCtx: AudioContext | null = null;
 
+export function applyAudioSessionCategory() {
+  if (typeof navigator !== 'undefined' && 'audioSession' in navigator) {
+    try {
+      (navigator as any).audioSession.type = 'playback';
+      console.log('[Audio] Successfully initialized primary audio category (playback) in iOS/Safari. Bypassing silent switch & keeping active.');
+    } catch (err) {
+      console.warn('[Audio] Failed to set navigator.audioSession.type:', err);
+    }
+  }
+}
+
 function getAudioContext(): AudioContext {
   if (!audioCtx) {
-    audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
+    const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+    audioCtx = new AudioCtx();
+    
+    // Auto-resume state observer
+    audioCtx.onstatechange = () => {
+      console.log(`[AudioCtx-State] New State: ${audioCtx?.state}`);
+      if (audioCtx?.state === 'suspended') {
+        audioCtx?.resume().catch(() => {});
+      }
+    };
   }
+  
+  applyAudioSessionCategory();
+  
   if (audioCtx.state === 'suspended') {
-    audioCtx.resume();
+    audioCtx.resume().catch(() => {});
   }
   return audioCtx;
 }
@@ -224,9 +247,13 @@ export function stopAllAudio() {
   });
   activeAudioElements.clear();
   
-  // Clear sequential Web Audio queue
-  unifiedAudioQueue.length = 0;
-  queueProcessing = false;
+  // Clear sequential Gift sounds queue
+  giftAudioQueue.length = 0;
+  giftQueueProcessing = false;
+
+  // Clear sequential TTS queue
+  ttsAudioQueue.length = 0;
+  ttsQueueProcessing = false;
 }
 
 // 2. Play custom Sound URLs or uploaded sound blobs with robust browser direct-load fallback
@@ -254,6 +281,7 @@ export function playSoundFromUrl(url: string, volume: number = 0.5): Promise<HTM
           finalUrl = `/api/proxy-audio?url=${encodeURIComponent(finalUrl)}`;
         }
 
+        applyAudioSessionCategory();
         const audio = new Audio(finalUrl);
         audio.volume = volume;
         trackAudio(audio);
@@ -289,30 +317,57 @@ export function playSoundFromUrl(url: string, volume: number = 0.5): Promise<HTM
   });
 }
 
-// 2.5 Unified audio queue system for sequential sound alerts and TTS speech
+// 2.5 Separate audio queues for Gift Sound Alerts and Chat TTS Speech
 type QueueTask = () => Promise<void>;
-const unifiedAudioQueue: QueueTask[] = [];
-let queueProcessing = false;
 
-async function runQueue() {
-  if (queueProcessing) return;
-  queueProcessing = true;
-  while (unifiedAudioQueue.length > 0) {
-    const task = unifiedAudioQueue.shift();
+// Separate Queue for Gift Sound Alerts (sequential among gifts, concurrent with TTS)
+const giftAudioQueue: QueueTask[] = [];
+let giftQueueProcessing = false;
+
+async function runGiftQueue() {
+  if (giftQueueProcessing) return;
+  giftQueueProcessing = true;
+  while (giftAudioQueue.length > 0) {
+    const task = giftAudioQueue.shift();
     if (task) {
       try {
         await task();
       } catch (e) {
-        console.error('[UnifiedAudioQueue] Error executing audio task:', e);
+        console.error('[GiftAudioQueue] Error executing audio task:', e);
       }
     }
   }
-  queueProcessing = false;
+  giftQueueProcessing = false;
 }
 
 export function queueSound(task: QueueTask) {
-  unifiedAudioQueue.push(task);
-  runQueue();
+  giftAudioQueue.push(task);
+  runGiftQueue();
+}
+
+// Separate Queue for Chat TTS Speech (sequential among chat, concurrent with Gift sounds)
+const ttsAudioQueue: QueueTask[] = [];
+let ttsQueueProcessing = false;
+
+async function runTtsQueue() {
+  if (ttsQueueProcessing) return;
+  ttsQueueProcessing = true;
+  while (ttsAudioQueue.length > 0) {
+    const task = ttsAudioQueue.shift();
+    if (task) {
+      try {
+        await task();
+      } catch (e) {
+        console.error('[TtsAudioQueue] Error executing TTS task:', e);
+      }
+    }
+  }
+  ttsQueueProcessing = false;
+}
+
+export function queueTts(task: QueueTask) {
+  ttsAudioQueue.push(task);
+  runTtsQueue();
 }
 
 export function updateMediaSessionMetadata(title: string, artist: string, album: string = 'TikTok Live Reader', artworkUrl?: string) {
@@ -344,7 +399,17 @@ export function playSoundFromUrlWithCompletion(url: string, volume: number = 0.5
       try {
         updateMediaSessionMetadata('Alerta: Sonido de Regalo', 'Efectos de Sonido');
         let rawUrl: string | null = null;
-        if (resolvedUrl.includes('/api/proxy-audio?url=')) {
+        
+        // Handle MyInstants prefixed URLs and proxying
+        let finalUrl = resolvedUrl;
+        while (finalUrl.startsWith('mi:')) {
+          finalUrl = finalUrl.substring(3);
+        }
+        rawUrl = finalUrl;
+        
+        if (finalUrl.includes('myinstants.com')) {
+          finalUrl = `/api/proxy-audio?url=${encodeURIComponent(finalUrl)}`;
+        } else if (resolvedUrl.includes('/api/proxy-audio?url=')) {
           try {
             const parsed = new URL(resolvedUrl, window.location.origin);
             const urlParam = parsed.searchParams.get('url');
@@ -354,8 +419,9 @@ export function playSoundFromUrlWithCompletion(url: string, volume: number = 0.5
           } catch (e) {}
         }
 
-        console.log('[AudioQueue] Playing resolved URL:', resolvedUrl.startsWith('data:') ? 'base64_data' : resolvedUrl);
-        const audio = new Audio(resolvedUrl);
+        console.log('[AudioQueue] Playing resolved URL:', finalUrl.startsWith('data:') ? 'base64_data' : finalUrl);
+        applyAudioSessionCategory();
+        const audio = new Audio(finalUrl);
         audio.volume = volume;
         trackAudio(audio);
         
@@ -369,6 +435,13 @@ export function playSoundFromUrlWithCompletion(url: string, volume: number = 0.5
         const handleEnded = () => {
           cleanUp();
           resolve();
+        };
+
+        let fallbackStarted = false;
+        const playDirectFallbackOnce = () => {
+          if (fallbackStarted) return;
+          fallbackStarted = true;
+          playDirectFallback();
         };
 
         const playDirectFallback = () => {
@@ -393,11 +466,18 @@ export function playSoundFromUrlWithCompletion(url: string, volume: number = 0.5
             resolve();
           };
 
+          let secondFallbackStarted = false;
+          const playSecondFallbackOnce = () => {
+            if (secondFallbackStarted) return;
+            secondFallbackStarted = true;
+            playSynthesizedSound('magic', volume);
+            setTimeout(resolve, 500);
+          };
+
           const fallbackHandleError = (eFallback: any) => {
             console.warn('[AudioQueue] Direct raw play also failed. Falling back to synth chime.', eFallback);
             fallbackCleanUp();
-            playSynthesizedSound('magic', volume);
-            setTimeout(resolve, 500);
+            playSecondFallbackOnce();
           };
 
           fallbackAudio.addEventListener('ended', fallbackHandleEnded);
@@ -405,15 +485,14 @@ export function playSoundFromUrlWithCompletion(url: string, volume: number = 0.5
 
           fallbackAudio.play().catch(err => {
             fallbackCleanUp();
-            playSynthesizedSound('magic', volume);
-            setTimeout(resolve, 500);
+            playSecondFallbackOnce();
           });
         };
 
         const handleError = (e: any) => {
           console.warn('[AudioQueue] URL failed to play/load. Shifting to direct raw fallback...', e);
           cleanUp();
-          playDirectFallback();
+          playDirectFallbackOnce();
         };
 
         audio.addEventListener('ended', handleEnded);
@@ -422,7 +501,7 @@ export function playSoundFromUrlWithCompletion(url: string, volume: number = 0.5
         audio.play().catch((err) => {
           console.warn('[AudioQueue] Playback blocked or failed. Retrying via raw fallback.', err);
           cleanUp();
-          playDirectFallback();
+          playDirectFallbackOnce();
         });
       } catch (err) {
         console.error('[AudioQueue] Failed playing custom URL sound:', err);
@@ -501,7 +580,7 @@ export function stopActiveTts() {
   }
 }
 
-// 3. Text-to-Speech (TTS) engine for reading chat comments in real-time (Unified Queue)
+// 3. Text-to-Speech (TTS) engine for reading chat comments in real-time (Independent TTS Queue)
 export function speakText(
   text: string, 
   volume: number = 0.8, 
@@ -511,7 +590,7 @@ export function speakText(
   provider: string = 'browser'
 ): Promise<void> {
   return new Promise((resolve) => {
-    queueSound(async () => {
+    queueTts(async () => {
       const trackItem: TtsTrack = {
         text,
         volume,
@@ -526,9 +605,10 @@ export function speakText(
       
       try {
         await runSingleSpeak(trackItem);
+        trackItem.resolve();
       } catch (err) {
-        console.error('[TTS] Error running single speak in unified queue:', err);
-        resolve(); // resolve to proceed with next item in the queue
+        console.error('[TTS] Error running single speak in independent TTS queue:', err);
+        trackItem.resolve();
       }
     });
   });
@@ -642,12 +722,10 @@ function runSingleSpeak(item: TtsTrack): Promise<void> {
         done();
       }, 30000);
 
-      audio.onended = () => {
-        clearTimeout(timeout);
-        done();
-      };
-      audio.onerror = (e) => {
-        console.warn(`[CloudTTS] Audio play failed for provider ${activeProvider}:`, e);
+      let fallbackStarted = false;
+      const triggerTtsFallback = () => {
+        if (fallbackStarted) return;
+        fallbackStarted = true;
         clearTimeout(timeout);
         
         // Fallback to local browser SpeechSynthesis to ensure audio voice is heard
@@ -677,37 +755,20 @@ function runSingleSpeak(item: TtsTrack): Promise<void> {
           done();
         }
       };
+
+      audio.onended = () => {
+        clearTimeout(timeout);
+        done();
+      };
+
+      audio.onerror = (e) => {
+        console.warn(`[CloudTTS] Audio play failed for provider ${activeProvider}:`, e);
+        triggerTtsFallback();
+      };
       
       audio.play().catch((err) => {
         console.warn(`[CloudTTS] Play promise failed:`, err);
-        clearTimeout(timeout);
-        
-        // Fallback to local browser SpeechSynthesis to ensure audio voice is heard
-        if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
-          console.log('[CloudTTS Fallback] Triggering Browser SpeechSynthesis via play catch...');
-          try {
-            window.speechSynthesis.resume();
-            const utterance = new SpeechSynthesisUtterance(text);
-            utterance.volume = volume;
-            utterance.rate = rate;
-            utterance.pitch = pitch;
-            
-            const voices = window.speechSynthesis.getVoices();
-            const spanishVoice = voices.find(v => v.lang.toLowerCase().includes('es'));
-            if (spanishVoice) {
-              utterance.voice = spanishVoice;
-            }
-            
-            utterance.onend = done;
-            utterance.onerror = done;
-            window.speechSynthesis.speak(utterance);
-          } catch (err) {
-            console.error('[CloudTTS Fallback] Speech synthesis fallback in catch crashed:', err);
-            done();
-          }
-        } else {
-          done();
-        }
+        triggerTtsFallback();
       });
     } catch (e) {
       console.error('TTS single speak error:', e);
@@ -752,6 +813,8 @@ export function unlockAudio() {
 // Global reference holders for Priority Background Audio Mode
 let globalKeepAliveAudioContext: AudioContext | null = null;
 let globalKeepAliveOscillator: OscillatorNode | null = null;
+let globalKeepAliveAudioElement: HTMLAudioElement | null = null;
+let backgroundWatchdogInterval: any = null;
 
 export function startBackgroundPriorityMode() {
   console.log('[Audio] Enabling Priority Background Audio Mode (Keep-Alive)...');
@@ -765,7 +828,15 @@ export function startBackgroundPriorityMode() {
     const ctx = new AudioCtx();
     globalKeepAliveAudioContext = ctx;
 
-    // Create an sub-audible (1Hz) oscillator to keep the dynamic audio pipeline active.
+    // Auto-resume keep alive context state changes
+    ctx.onstatechange = () => {
+      console.log(`[KeepAlive-CtxState] State: ${ctx.state}`);
+      if (ctx.state === 'suspended') {
+        ctx.resume().catch(() => {});
+      }
+    };
+
+    // Create a sub-audible (1Hz) oscillator to keep the dynamic audio pipeline active.
     // Modern desktop & mobile browsers will NOT suspend or throttle JavaScript Execution in a tab
     // that is actively generating/playing audio.
     const osc = ctx.createOscillator();
@@ -779,6 +850,36 @@ export function startBackgroundPriorityMode() {
     
     osc.start();
     globalKeepAliveOscillator = osc;
+
+    // --- HTML5 Audio Element Keep-Alive ---
+    // High-performance solution for mobile and tablet browsers to guarantee tab execution
+    // when the browser tab goes into background or screen locks.
+    const SILENT_AUDIO_BASE64 = "data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAAABAAEARKwAAIhYAQACABAAAABkYXRhAgAAAAEA";
+    const silentAudio = new Audio(SILENT_AUDIO_BASE64);
+    silentAudio.loop = true;
+    silentAudio.volume = 0.001; // low volume to prevent any audible hum but keeps engine alive
+    
+    applyAudioSessionCategory();
+
+    // Recover if browser pauses our silent audio during external music overlays (like Spotify playing)
+    silentAudio.addEventListener('pause', () => {
+      if (globalKeepAliveAudioElement === silentAudio) {
+        console.log('[Audio] Keep-alive audio paused by system interruption. Recovering primary playback in 1s...');
+        setTimeout(() => {
+          if (globalKeepAliveAudioElement === silentAudio) {
+            applyAudioSessionCategory();
+            silentAudio.play().catch(() => {});
+          }
+        }, 1000);
+      }
+    });
+
+    silentAudio.play().then(() => {
+      console.log('[Audio] HTML5 audio keep-alive background track playing successfully.');
+    }).catch(err => {
+      console.warn('[Audio] HTML5 audio keep-alive play deferred until user interaction:', err);
+    });
+    globalKeepAliveAudioElement = silentAudio;
     
     // Hook up OS Media Session to let device prioritize this background media thread
     if ('mediaSession' in navigator) {
@@ -790,11 +891,22 @@ export function startBackgroundPriorityMode() {
       // Register standard action handlers to reinforce audio thread status with the OS Scheduler
       navigator.mediaSession.setActionHandler('play', () => {
         console.log('[Audio] MediaSession play action triggered.');
+        if (globalKeepAliveAudioElement) {
+          globalKeepAliveAudioElement.play().catch(() => {});
+        }
       });
       navigator.mediaSession.setActionHandler('pause', () => {
         console.log('[Audio] MediaSession pause action triggered.');
+        if (globalKeepAliveAudioElement) {
+          globalKeepAliveAudioElement.pause();
+        }
       });
     }
+
+    // Passive active audio focus/interruption watchdog to auto-recover our background pipeline
+    backgroundWatchdogInterval = setInterval(() => {
+      recoverBackgroundAudioState();
+    }, 4000);
     
     console.log('[Audio] Priority Background Audio Mode launched successfully. Tab won\'t freeze in background!');
   } catch (err) {
@@ -802,13 +914,46 @@ export function startBackgroundPriorityMode() {
   }
 }
 
+export function recoverBackgroundAudioState() {
+  // 1. Recover main sound AudioContext
+  if (audioCtx && audioCtx.state === 'suspended') {
+    console.log('[AudioWatchdog] Re-activating main AudioContext due to suspension...');
+    audioCtx.resume().catch(() => {});
+  }
+  // 2. Recover keep alive context
+  if (globalKeepAliveAudioContext && globalKeepAliveAudioContext.state === 'suspended') {
+    console.log('[AudioWatchdog] Re-activating keep-alive AudioContext due to suspension...');
+    globalKeepAliveAudioContext.resume().catch(() => {});
+  }
+  // 3. Recover keep alive audio element play
+  if (globalKeepAliveAudioElement && globalKeepAliveAudioElement.paused) {
+    console.log('[AudioWatchdog] Re-activating silenter audio loop play...');
+    globalKeepAliveAudioElement.play().catch(() => {});
+  }
+  // 4. Force mix ambient session category for concurrent app playback
+  applyAudioSessionCategory();
+}
+
 export function stopBackgroundPriorityMode() {
   console.log('[Audio] Disabling Priority Background Audio Mode...');
+  
+  if (backgroundWatchdogInterval) {
+    clearInterval(backgroundWatchdogInterval);
+    backgroundWatchdogInterval = null;
+  }
+
   try {
     if (globalKeepAliveOscillator) {
       globalKeepAliveOscillator.stop();
       globalKeepAliveOscillator.disconnect();
       globalKeepAliveOscillator = null;
+    }
+  } catch (e) {}
+
+  try {
+    if (globalKeepAliveAudioElement) {
+      globalKeepAliveAudioElement.pause();
+      globalKeepAliveAudioElement = null;
     }
   } catch (e) {}
 

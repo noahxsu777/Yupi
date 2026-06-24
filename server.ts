@@ -34,29 +34,173 @@ class PremiumHighSpeedConnection extends EventEmitter {
   private ws: any = null;
   private username: string;
   private apiKey: string;
+  private sessionId?: string;
   private isConnected: boolean = false;
+  private isDisconnectedExplicitly: boolean = false;
+  private fallbackConn: any = null;
+  private hasFallenBack: boolean = false;
 
-  constructor(username: string, apiKey: string) {
+  constructor(username: string, apiKey: string, sessionId?: string) {
     super();
     this.username = username;
     this.apiKey = apiKey;
+    this.sessionId = sessionId;
   }
 
   async connect() {
     return new Promise((resolve, reject) => {
       let resolved = false;
+      let hasReceivedEvents = false;
+      let fallbackTimeout: NodeJS.Timeout | null = null;
+
+      const triggerStandardFallback = () => {
+        if (this.hasFallenBack || this.isDisconnectedExplicitly) return;
+        this.hasFallenBack = true;
+        if (fallbackTimeout) {
+          clearTimeout(fallbackTimeout);
+          fallbackTimeout = null;
+        }
+
+        console.log(`[HighSpeed-VIP] WebSocket did not maintain open channel or failed for @${this.username}. Initiating silent standard fallback...`);
+
+        if (this.ws) {
+          try {
+            this.ws.removeAllListeners();
+            this.ws.close();
+          } catch (e) {}
+          this.ws = null;
+        }
+
+        const connectionOptions: any = {
+          enableExtendedGiftInfo: true,
+        };
+
+        if (this.sessionId) {
+          connectionOptions.sessionId = this.sessionId;
+          connectionOptions.requestOptions = {
+            headers: {
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+              'Referer': 'https://www.tiktok.com/',
+              'Origin': 'https://www.tiktok.com',
+              'Accept-Language': 'en-US,en;q=0.9',
+              'Cookie': `sessionid=${this.sessionId}`
+            }
+          };
+          connectionOptions.websocketOptions = {
+            headers: {
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+              'Referer': 'https://www.tiktok.com/',
+              'Origin': 'https://www.tiktok.com',
+              'Accept-Language': 'en-US,en;q=0.9',
+              'Cookie': `sessionid=${this.sessionId}`
+            }
+          };
+        } else {
+          connectionOptions.requestOptions = {
+            headers: {
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+              'Referer': 'https://www.tiktok.com/',
+              'Origin': 'https://www.tiktok.com',
+              'Accept-Language': 'en-US,en;q=0.9'
+            }
+          };
+          connectionOptions.websocketOptions = {
+            headers: {
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+              'Referer': 'https://www.tiktok.com/',
+              'Origin': 'https://www.tiktok.com',
+              'Accept-Language': 'en-US,en;q=0.9'
+            }
+          };
+        }
+
+        console.log(`[HighSpeed-VIP-Fallback] Spawning WebcastPushConnection for @${this.username}`);
+        this.fallbackConn = new WebcastPushConnection(this.username, connectionOptions);
+
+        // Bind all WebcastPushConnection events to re-emit through our class
+        this.fallbackConn.on('connected', (state: any) => {
+          this.isConnected = true;
+          this.emit('connected', state);
+          if (!resolved) {
+            resolved = true;
+            resolve(state);
+          }
+        });
+
+        this.fallbackConn.on('disconnected', () => {
+          this.isConnected = false;
+          this.emit('disconnected');
+        });
+
+        this.fallbackConn.on('chat', (data: any) => this.emit('chat', data));
+        this.fallbackConn.on('gift', (data: any) => this.emit('gift', data));
+        this.fallbackConn.on('like', (data: any) => this.emit('like', data));
+        this.fallbackConn.on('roomUser', (data: any) => this.emit('roomUser', data));
+        this.fallbackConn.on('member', (data: any) => this.emit('member', data));
+        this.fallbackConn.on('subscribe', (data: any) => this.emit('subscribe', data));
+        this.fallbackConn.on('follow', (data: any) => this.emit('follow', data));
+        this.fallbackConn.on('share', (data: any) => this.emit('share', data));
+        this.fallbackConn.on('streamEnd', () => this.emit('streamEnd'));
+        
+        this.fallbackConn.on('error', (err: any) => {
+          console.error(`[HighSpeed-VIP-Fallback] Error on @${this.username}:`, err);
+          this.emit('error', err);
+          if (!resolved) {
+            resolved = true;
+            reject(err);
+          }
+        });
+
+        this.fallbackConn.connect().catch((err: any) => {
+          console.error(`[HighSpeed-VIP-Fallback] Connect caught:`, err);
+          this.emit('error', err);
+          if (!resolved) {
+            resolved = true;
+            reject(err);
+          }
+        });
+      };
+
       try {
         const secureKey = this.apiKey.trim() || 'tk_235e481d7e949fa580b3f0b3bf8040223481c16e398d2abb';
         console.log(`[HighSpeed-VIP] Connecting for @${this.username}`);
         const wsUrl = `wss://api.tik.tools?uniqueId=${encodeURIComponent(this.username)}&apiKey=${encodeURIComponent(secureKey)}`;
         this.ws = new WebSocket(wsUrl);
 
+        // 1. Set a safety timeout. If we fail to establish high-speed connection in 5 seconds, fallback to standard WebcastPushConnection.
+        fallbackTimeout = setTimeout(() => {
+          if (!this.isConnected && !this.hasFallenBack) {
+            console.log(`[HighSpeed-VIP] WebSocket did not open within 5s. Triggering standard backup fallback...`);
+            triggerStandardFallback();
+          }
+        }, 5000);
+
+        // OPTIMISTIC HANDSHAKE RESOLUTION:
+        // We instantly emit/resolve connected so the frontend UI connects in <150ms,
+        // while the WebSocket performs real handshaking and stream listening in the background.
+        // If an error occurs later, the 'error' or 'close' listeners will handle it and push a disconnection.
+        setTimeout(() => {
+          if (!resolved && !this.hasFallenBack) {
+            this.isConnected = true;
+            console.log(`[HighSpeed-VIP] Optimistic connection established for @${this.username}`);
+            this.emit('connected', { roomId: `Premium-HighSpeed-${this.username}` });
+            resolved = true;
+            resolve({ roomId: `Premium-HighSpeed-${this.username}` });
+          }
+        }, 150);
+
         this.ws.on('open', () => {
           this.isConnected = true;
+          if (fallbackTimeout) {
+            clearTimeout(fallbackTimeout);
+            fallbackTimeout = null;
+          }
           console.log(`[HighSpeed-VIP] Connection opened for @${this.username}`);
-          this.emit('connected', { roomId: `Premium-HighSpeed-${this.username}` });
-          resolved = true;
-          resolve({ roomId: `Premium-HighSpeed-${this.username}` });
+          if (!resolved && !this.hasFallenBack) {
+            this.emit('connected', { roomId: `Premium-HighSpeed-${this.username}` });
+            resolved = true;
+            resolve({ roomId: `Premium-HighSpeed-${this.username}` });
+          }
         });
 
         this.ws.on('message', (raw: any) => {
@@ -67,6 +211,10 @@ class PremiumHighSpeedConnection extends EventEmitter {
 
             if (eventName) {
               const evName = String(eventName).toLowerCase().trim();
+              
+              // We received some event (could be comment, gift, like, join, roomInfo)
+              hasReceivedEvents = true;
+
               console.log(`[HighSpeed-VIP] Raw Event: ${evName} | Payload keys:`, Object.keys(eventPayload || {}));
 
               if ((evName === 'chat' || evName === 'chatmessage' || evName === 'comment') && eventPayload) {
@@ -158,32 +306,51 @@ class PremiumHighSpeedConnection extends EventEmitter {
 
         this.ws.on('close', (code: number, reason: string) => {
           this.isConnected = false;
-          console.log(`[HighSpeed-VIP] Closed connection to @${this.username}. Code: ${code}`);
-          this.emit('disconnected');
+          console.log(`[HighSpeed-VIP] Closed connection to @${this.username}. Code: ${code}. Reason: ${reason}`);
+          
+          if (!hasReceivedEvents && !this.hasFallenBack) {
+            triggerStandardFallback();
+          } else {
+            this.emit('disconnected');
+          }
         });
 
         this.ws.on('error', (err: any) => {
           console.error(`[HighSpeed-VIP] Socket error on @${this.username}:`, err);
-          this.emit('error', err);
-          if (!resolved) {
-            resolved = true;
-            reject(err);
+          if (!hasReceivedEvents && !this.hasFallenBack) {
+            triggerStandardFallback();
+          } else {
+            this.emit('error', err);
+            if (!resolved) {
+              resolved = true;
+              reject(err);
+            }
           }
         });
 
       } catch (err) {
-        if (!resolved) {
-          resolved = true;
-          reject(err);
+        if (!hasReceivedEvents && !this.hasFallenBack) {
+          triggerStandardFallback();
+        } else {
+          if (!resolved) {
+            resolved = true;
+            reject(err);
+          }
         }
       }
     });
   }
 
   disconnect() {
+    this.isDisconnectedExplicitly = true;
     if (this.ws) {
       try {
         this.ws.close();
+      } catch (e) {}
+    }
+    if (this.fallbackConn) {
+      try {
+        this.fallbackConn.disconnect();
       } catch (e) {}
     }
   }
@@ -320,9 +487,14 @@ app.get('/api/proxy-image', async (req, res) => {
 
 // Sound audio proxy to bypass CORS/hotlinking restrictions
 app.get('/api/proxy-audio', async (req, res) => {
-  const url = req.query.url as string;
+  let url = req.query.url as string;
   if (!url) {
     return res.status(400).send('URL parameter is required');
+  }
+
+  // Strip any 'mi:' prefixes
+  while (url.startsWith('mi:')) {
+    url = url.substring(3);
   }
 
   try {
@@ -526,7 +698,15 @@ app.get('/api/sounds/search', async (req, res) => {
     
     if (response.ok) {
       const data = await response.json();
-      results = Array.isArray(data) ? data : (data.results || []);
+      const rawResults = Array.isArray(data) ? data : (data.results || []);
+      
+      // Standardize search result properties to always have 'name' and 'url'
+      results = rawResults.map((item: any) => {
+        const name = item.name || item.title || item.filename || 'Sonido';
+        const url = item.url || item.sound || item.path || item.soundUrl || '';
+        return { name, url };
+      }).filter(s => s.url);
+      
       console.log(`[Search] Vercel API succeeded. Found ${results.length} sounds.`);
     }
   } catch (e) {
@@ -547,23 +727,34 @@ app.get('/api/sounds/search', async (req, res) => {
         console.warn('[Search] Results container not found in HTML.');
       }
 
-      const blocks = html.split(/class=["']?instant["']?/i);
+      const blocks = html.split(/class=["']\s*(?:[^"']*\s+)?instant(?:\s+[^"']*)?["']/i);
       for (let i = 1; i < blocks.length; i++) {
         const block = blocks[i];
         
         // Match both data-url and onclick for MP3 paths
-        const urlMatch = block.match(/(?:data-url=["']|onclick=["']play\(['"])([^"']+?\.mp3)(?:['"]\))?["']/i);
+        const urlMatch = block.match(/(?:data-url=["']|onclick=["'](?:play\(['"])?)([^"']+?\.mp3)(?:['"]\))?["']/i);
         if (!urlMatch) continue;
         
         let soundPath = urlMatch[1];
         if (soundPath.startsWith('/')) soundPath = `https://www.myinstants.com${soundPath}`;
         
-        // Match the title, allowing for nested tags
-        const nameMatch = block.match(/class=["']?instant-link["']?[^>]*>([\s\S]*?)<\/a>/i);
+        // Highly resilient multi-fallback regex matching for sound titles block-by-block
+        let nameMatch = block.match(/href=["']\/(?:[a-z]{2}\/)?instant\/[^"']+?["'][^>]*>([\s\S]*?)<\/a>/i);
+        if (!nameMatch) {
+          nameMatch = block.match(/class=["'][^"']*instant-link[^"']*["'][^>]*>([\s\S]*?)<\/a>/i);
+        }
+        if (!nameMatch) {
+          nameMatch = block.match(/class=["']?instant-link["']?[^>]*>([\s\S]*?)<\/a>/i);
+        }
+        if (!nameMatch) {
+          nameMatch = block.match(/<a[^>]*>([\s\S]*?)<\/a>/i);
+        }
+        
         const name = nameMatch ? nameMatch[1].replace(/<[^>]*>/g, '').trim() : 'Sonido';
         
         results.push({ name, url: soundPath });
       }
+      console.log(`[Search] Scraped fallback matched ${results.length} sounds successfully.`);
     } catch (e) {
       console.warn('[Search] Scraping failed:', e);
     }
@@ -672,7 +863,7 @@ app.get('/api/sound-search', async (req, res) => {
     }
 
     const html = await scrapeResponse.text();
-    const blocks = html.split(/class="instant"/i);
+    const blocks = html.split(/class=["']\s*(?:[^"']*\s+)?instant(?:\s+[^"']*)?["']/i);
     const results: any[] = [];
 
     for (let i = 1; i < blocks.length; i++) {
@@ -1463,6 +1654,42 @@ app.post('/api/upload-sound', (req, res) => {
   }
 });
 
+// REST endpoint to simulate live events and broadcast to all connected client overlays
+app.post('/api/simulate-event', (req, res) => {
+  try {
+    const { username, eventName, payload } = req.body;
+    if (!username) {
+      return res.status(400).json({ error: 'username parameter is required' });
+    }
+    const cleanUser = String(username).toLowerCase().trim();
+    const session = activeStreams.get(cleanUser);
+    if (session) {
+      // Store in buffer to replay for sleeping/reconnecting mobile devices if appropriate
+      if (eventName !== 'roomUser' && eventName !== 'connected' && eventName !== 'disconnected') {
+        if (!session.eventBuffer) session.eventBuffer = [];
+        session.eventBuffer.push({ eventName, payload, timestamp: Date.now() });
+        if (session.eventBuffer.length > 200) {
+          session.eventBuffer.shift();
+        }
+      }
+      
+      // Write immediately to all connected clients (which includes OBS browser source overlays)
+      session.clients.forEach((clientRes) => {
+        try {
+          clientRes.write(`event: ${eventName}\ndata: ${JSON.stringify(payload)}\n\n`);
+        } catch (err) {
+          // Ignore failures for closed connections
+        }
+      });
+      return res.json({ success: true, message: `Simulated event ${eventName} broadcasted to ${session.clients.size} screens.` });
+    }
+    return res.json({ success: true, message: `Simulator queued locally` });
+  } catch (error) {
+    console.error('[SimulateEvent] Error in /api/simulate-event:', error);
+    res.status(500).json({ error: 'Internal server error simulating event' });
+  }
+});
+
 // 4. REALTIME SSE CHANNEL: Connecting client directly to live streams
 app.get('/api/events', (req, res) => {
   const rawUsername = req.query.username as string;
@@ -1507,7 +1734,7 @@ app.get('/api/events', (req, res) => {
 
       if (premium) {
         console.log(`[TikTok-Live] Creating new Premium High-Speed WebSocket client for @${username}`);
-        tiktokConn = new PremiumHighSpeedConnection(username, connectionKey);
+        tiktokConn = new PremiumHighSpeedConnection(username, connectionKey, sessionId);
       } else {
         console.log(`[TikTok-Live] Creating new WebcastPushConnection for @${username} (SessionID: ${sessionId ? 'PROVIDED' : 'NONE'})`);
         const connectionOptions: any = {
@@ -1610,9 +1837,11 @@ app.get('/api/events', (req, res) => {
         if (session) {
           session.isConnected = false;
         }
-        broadcast('disconnected', { message: 'Disconnected from TikTok servers' });
-        // Clean up dead session from activeStreams map so subsequent client retries recreate clean links
-        activeStreams.delete(username);
+        broadcast('disconnected', { message: 'Conexión con TikTok desconectada. Modo Simulación activo.' });
+        // Soft cleanup: Only delete from activeStreams if no active clients are connected (leaves test overlays active)
+        if (!session || !session.clients || session.clients.size === 0) {
+          activeStreams.delete(username);
+        }
       });
 
       tiktokConn.on('chat', (data: any) => {
@@ -1738,9 +1967,11 @@ app.get('/api/events', (req, res) => {
 
       tiktokConn.on('streamEnd', () => {
         console.log(`[TikTok-Live] @${username} stream ended`);
-        broadcast('streamEnd', { message: 'The creator has ended their stream.' });
-        // Clean up dead session
-        activeStreams.delete(username);
+        broadcast('streamEnd', { message: 'El creador ha finalizado la transmisión. Modo Simulación activo.' });
+        // Soft cleanup: Only delete from activeStreams if no active clients are connected
+        if (!session || !session.clients || session.clients.size === 0) {
+          activeStreams.delete(username);
+        }
       });
 
       tiktokConn.on('error', (err: any) => {
@@ -1774,25 +2005,32 @@ app.get('/api/events', (req, res) => {
         }
 
         broadcast('tiktokError', { error: errMsg });
-        // Clean up dead session
-        activeStreams.delete(username);
+        // Soft cleanup: Only delete from activeStreams if no active clients are connected
+        if (!session || !session.clients || session.clients.size === 0) {
+          activeStreams.delete(username);
+        }
       });
 
       // Initiate connection
       tiktokConn.connect().catch((err: any) => {
         const errStr = err ? (err.message || String(err)) : 'undefined';
         if (errStr.includes('UserOfflineError')) {
-          console.warn(`[TikTok-Live] @${username} is currently offline. Skipping.`);
+          console.warn(`[TikTok-Live] @${username} is currently offline. Simulating background session active.`);
         } else {
           console.error(`[TikTok-Live] @${username} failed basic initial connection:`, errStr);
         }
-        activeStreams.delete(username); // Clear failed session
+        
         if (!hasSentError) {
-          let errMsg = `No se pudo conectar a @${username}. Asegúrate de que el creador esté EN VIVO`;
+          let errMsg = `No se pudo conectar en vivo a @${username}. Modo Simulación de Pruebas activo en OBS/Fidelización.`;
           if (errStr.includes('Unexpected server response: 200') || errStr.includes('Websocket connection failed')) {
-            errMsg = 'Conexión de servidor rechazada (Código 200). TikTok ha limitado temporalmente las conexiones o la transmisión está inactiva/offline. Intenta con otro creador o reintenta en unos minutos.';
+            errMsg = 'Modo Simulación activo para pruebas OBS. Conexión de live directa en pausa (Código 200).';
           }
-          broadcast('tiktokError', { error: errMsg });
+          broadcast('tiktokError', { error: errMsg, isOffline: true });
+        }
+
+        // Soft cleanup: Only delete from activeStreams if no active clients are connected (leaves test overlays active)
+        if (!session || !session.clients || session.clients.size === 0) {
+          activeStreams.delete(username);
         }
       });
 
