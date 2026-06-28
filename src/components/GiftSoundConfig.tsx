@@ -28,6 +28,10 @@ export default function GiftSoundConfig({
   const [newGiftName, setNewGiftName] = useState('');
   const [newSoundId, setNewSoundId] = useState('coin');
   const [newVolume, setNewVolume] = useState(0.8);
+  const [editingGiftIdName, setEditingGiftIdName] = useState<string | null>(null);
+  const [tempGiftIdValue, setTempGiftIdValue] = useState<string>('');
+  const [creatingNewGiftForSoundIndex, setCreatingNewGiftForSoundIndex] = useState<number | null>(null);
+  const [newGiftNameForSound, setNewGiftNameForSound] = useState<string>('');
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [activeTab, setActiveTab] = useState<'mappings' | 'discovered' | 'catalog'>('mappings');
   const [soundboardExpanded, setSoundboardExpanded] = useState(true);
@@ -849,21 +853,59 @@ export default function GiftSoundConfig({
                                 <Volume2 className="w-3 h-3 text-[#ff0050]" />
                                 Vol: {Math.round(mapping.volume * 100)}%
                               </div>
-                              <button
-                                type="button"
-                                onClick={() => {
-                                  const currentId = mapping.giftId ? String(mapping.giftId) : "";
-                                  const newId = prompt(`Ingresa el nuevo ID real de TikTok para el regalo "${mapping.giftName}":\n(Ej: Capybara es 14488, Rosa es 5655)`, currentId);
-                                  if (newId !== null) {
-                                    handleChangeMappingProp(mapping.giftName, 'giftId', newId.trim());
-                                    showStatus(`¡ID de regalo actualizado a ${newId.trim() || 'Ninguno'} con éxito!`, 'success');
-                                  }
-                                }}
-                                className="text-[9px] text-gray-500 hover:text-white underline font-mono cursor-pointer transition-colors"
-                                title="Hacer clic para ingresar o modificar el ID numérico real de este regalo en TikTok"
-                              >
-                                [Editar ID]
-                              </button>
+                              {editingGiftIdName === mapping.giftName ? (
+                                <div className="flex items-center gap-1 bg-black/40 border border-white/10 rounded px-1 py-0.5 animate-fade-in">
+                                  <input
+                                    type="text"
+                                    value={tempGiftIdValue}
+                                    onChange={(e) => setTempGiftIdValue(e.target.value)}
+                                    placeholder="ID de TikTok (ej: 7934)"
+                                    className="bg-transparent text-[10px] text-white focus:outline-none w-28 font-mono"
+                                    autoFocus
+                                    onKeyDown={(e) => {
+                                      if (e.key === 'Enter') {
+                                        handleChangeMappingProp(mapping.giftName, 'giftId', tempGiftIdValue.trim());
+                                        showStatus(`¡ID de regalo actualizado a ${tempGiftIdValue.trim() || 'Ninguno'} con éxito!`, 'success');
+                                        setEditingGiftIdName(null);
+                                      } else if (e.key === 'Escape') {
+                                        setEditingGiftIdName(null);
+                                      }
+                                    }}
+                                  />
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      handleChangeMappingProp(mapping.giftName, 'giftId', tempGiftIdValue.trim());
+                                      showStatus(`¡ID de regalo actualizado a ${tempGiftIdValue.trim() || 'Ninguno'} con éxito!`, 'success');
+                                      setEditingGiftIdName(null);
+                                    }}
+                                    className="text-[10px] text-emerald-400 hover:text-emerald-355 font-bold px-1 transition-all"
+                                    title="Guardar"
+                                  >
+                                    ✓
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => setEditingGiftIdName(null)}
+                                    className="text-[10px] text-red-450 hover:text-red-400 font-bold px-1 transition-all"
+                                    title="Cancelar"
+                                  >
+                                    ✕
+                                  </button>
+                                </div>
+                              ) : (
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setEditingGiftIdName(mapping.giftName);
+                                    setTempGiftIdValue(mapping.giftId ? String(mapping.giftId) : "");
+                                  }}
+                                  className="text-[9px] text-gray-500 hover:text-white underline font-mono cursor-pointer transition-colors"
+                                  title="Hacer clic para ingresar o modificar el ID numérico real de este regalo en TikTok"
+                                >
+                                  [Editar ID]
+                                </button>
+                              )}
                             </div>
                           </div>
                         </div>
@@ -1379,59 +1421,123 @@ export default function GiftSoundConfig({
                             </div>
 
                             {/* Instantly Link or Create New Gift action block */}
-                            <div className="flex items-center gap-1.5 pt-1.5 border-t border-white/5">
-                              <select
-                                id={`soundboard-select-${idx}`}
-                                className="bg-black/50 border border-white/10 rounded px-1 py-0.5 text-[9.5px] text-gray-300 focus:outline-none focus:border-[#00f2ea]/50 flex-1 font-sans cursor-pointer"
-                                defaultValue=""
-                              >
-                                <option value="" disabled>➡️ Vincular a...</option>
-                                {mappings.map(m => (
-                                  <option key={m.giftName} value={m.giftName}>
-                                    🎁 {m.giftName}
-                                  </option>
-                                ))}
-                              </select>
+                            {creatingNewGiftForSoundIndex === idx ? (
+                              <div className="flex flex-col gap-1.5 pt-1.5 border-t border-white/5 animate-fade-in">
+                                <input
+                                  type="text"
+                                  value={newGiftNameForSound}
+                                  onChange={(e) => setNewGiftNameForSound(e.target.value)}
+                                  placeholder="Nombre del regalo (ej: Rosa)"
+                                  className="bg-black/60 border border-white/10 rounded px-2 py-1 text-[10px] text-white focus:outline-none w-full font-mono"
+                                  autoFocus
+                                  onKeyDown={(e) => {
+                                    if (e.key === 'Enter') {
+                                      const nameToUse = newGiftNameForSound.trim();
+                                      if (!nameToUse) {
+                                        setCreatingNewGiftForSoundIndex(null);
+                                        return;
+                                      }
+                                      if (mappings.some(m => m.giftName.toLowerCase() === nameToUse.toLowerCase())) {
+                                        showStatus(`El regalo "${nameToUse}" ya existe. Elige otro nombre.`, 'warning');
+                                        return;
+                                      }
+                                      const newMap: GiftSoundMapping = {
+                                        giftName: nameToUse,
+                                        soundId: 'custom',
+                                        volume: 0.8,
+                                        label: nameToUse,
+                                        customSoundUrl: sound.url
+                                      };
+                                      onUpdateMapping([newMap, ...mappings]);
+                                      showStatus(`¡Regalo "${nameToUse}" creado y vinculado con éxito!`, 'success');
+                                      setCreatingNewGiftForSoundIndex(null);
+                                      setNewGiftNameForSound('');
+                                    } else if (e.key === 'Escape') {
+                                      setCreatingNewGiftForSoundIndex(null);
+                                    }
+                                  }}
+                                />
+                                <div className="flex justify-end gap-1">
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      const nameToUse = newGiftNameForSound.trim();
+                                      if (!nameToUse) {
+                                        setCreatingNewGiftForSoundIndex(null);
+                                        return;
+                                      }
+                                      if (mappings.some(m => m.giftName.toLowerCase() === nameToUse.toLowerCase())) {
+                                        showStatus(`El regalo "${nameToUse}" ya existe. Elige otro nombre.`, 'warning');
+                                        return;
+                                      }
+                                      const newMap: GiftSoundMapping = {
+                                        giftName: nameToUse,
+                                        soundId: 'custom',
+                                        volume: 0.8,
+                                        label: nameToUse,
+                                        customSoundUrl: sound.url
+                                      };
+                                      onUpdateMapping([newMap, ...mappings]);
+                                      showStatus(`¡Regalo "${nameToUse}" creado y vinculado con éxito!`, 'success');
+                                      setCreatingNewGiftForSoundIndex(null);
+                                      setNewGiftNameForSound('');
+                                    }}
+                                    className="text-[9px] bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-400 font-bold px-2 py-0.5 rounded uppercase"
+                                  >
+                                    Confirmar
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      setCreatingNewGiftForSoundIndex(null);
+                                      setNewGiftNameForSound('');
+                                    }}
+                                    className="text-[9px] bg-red-500/10 hover:bg-red-500/20 text-red-400 font-bold px-2 py-0.5 rounded uppercase"
+                                  >
+                                    Cancelar
+                                  </button>
+                                </div>
+                              </div>
+                            ) : (
+                              <div className="flex items-center gap-1.5 pt-1.5 border-t border-white/5">
+                                <select
+                                  id={`soundboard-select-${idx}`}
+                                  className="bg-black/50 border border-white/10 rounded px-1 py-0.5 text-[9.5px] text-gray-300 focus:outline-none focus:border-[#00f2ea]/50 flex-1 font-sans cursor-pointer"
+                                  defaultValue=""
+                                >
+                                  <option value="" disabled>➡️ Vincular a...</option>
+                                  <option value="__NEW_GIFT__">🆕 [Crear Nuevo Regalo]</option>
+                                  {mappings.map(m => (
+                                    <option key={m.giftName} value={m.giftName}>
+                                      🎁 {m.giftName}
+                                    </option>
+                                  ))}
+                                </select>
 
-                              <button
-                                type="button"
-                                onClick={() => {
-                                  const selectEl = document.getElementById(`soundboard-select-${idx}`) as HTMLSelectElement;
-                                  const selectedGift = selectEl?.value;
-                                  if (!selectedGift) {
-                                    // If they don't select a gift, offer to create one with a clean name
-                                    let nameToUse = prompt("Ingresa el nombre del regalo nuevo para este sonido (ej: Rose, TikTok, Chile):");
-                                    if (!nameToUse) return;
-                                    nameToUse = nameToUse.trim();
-                                    if (!nameToUse) return;
-
-                                    if (mappings.some(m => m.giftName.toLowerCase() === nameToUse!.toLowerCase())) {
-                                      showStatus(`El regalo "${nameToUse}" ya existe. Elige otro nombre.`, 'warning');
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    const selectEl = document.getElementById(`soundboard-select-${idx}`) as HTMLSelectElement;
+                                    const selectedGift = selectEl?.value;
+                                    if (!selectedGift) return;
+                                    
+                                    if (selectedGift === '__NEW_GIFT__') {
+                                      setCreatingNewGiftForSoundIndex(idx);
+                                      setNewGiftNameForSound('');
                                       return;
                                     }
-
-                                    const newMap: GiftSoundMapping = {
-                                      giftName: nameToUse,
-                                      soundId: 'custom',
-                                      volume: 0.8,
-                                      label: nameToUse,
-                                      customSoundUrl: sound.url
-                                    };
-                                    onUpdateMapping([newMap, ...mappings]);
-                                    showStatus(`¡Regalo "${nameToUse}" creado y vinculado al sonido con éxito!`, 'success');
-                                    return;
-                                  }
-                                  
-                                  handleLinkSoundToGift(selectedGift, sound.url);
-                                  showStatus(`¡Efecto vinculado al regalo "${selectedGift}"!`, 'success');
-                                  selectEl.value = ""; // Reset dropdown
-                                }}
-                                className="px-2 py-0.5 rounded bg-emerald-500/10 hover:bg-emerald-500 hover:text-black border border-emerald-500/30 text-emerald-400 hover:border-transparent text-[9px] font-bold uppercase tracking-wider transition-all"
-                                title="Haz clic para vincular al regalo seleccionado o para crear un regalo nuevo"
-                              >
-                                OK
-                              </button>
-                            </div>
+                                    
+                                    handleLinkSoundToGift(selectedGift, sound.url);
+                                    showStatus(`¡Efecto vinculado al regalo "${selectedGift}"!`, 'success');
+                                    selectEl.value = ""; // Reset dropdown
+                                  }}
+                                  className="px-2 py-0.5 rounded bg-emerald-500/10 hover:bg-emerald-500 hover:text-black border border-emerald-500/30 text-emerald-400 hover:border-transparent text-[9px] font-bold uppercase tracking-wider transition-all"
+                                  title="Haz clic para vincular al regalo seleccionado o para crear un regalo nuevo"
+                                >
+                                  OK
+                                </button>
+                              </div>
+                            )}
                           </div>
                         ))}
                       </div>

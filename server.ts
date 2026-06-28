@@ -162,7 +162,7 @@ class PremiumHighSpeedConnection extends EventEmitter {
       };
 
       try {
-        const secureKey = this.apiKey.trim() || 'tk_235e481d7e949fa580b3f0b3bf8040223481c16e398d2abb';
+        const secureKey = this.apiKey.trim() || 'tk_ea4ff46c723149776d64ead0ea0b1ff042d6bd762f00453b';
         console.log(`[HighSpeed-VIP] Connecting for @${this.username}`);
         const wsUrl = `wss://api.tik.tools?uniqueId=${encodeURIComponent(this.username)}&apiKey=${encodeURIComponent(secureKey)}`;
         this.ws = new WebSocket(wsUrl);

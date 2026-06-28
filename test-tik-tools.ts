@@ -2,7 +2,7 @@ import WebSocket from 'ws';
 
 async function testLongConn() {
   const username = 'tiktok';
-  const apiKey = 'tk_235e481d7e949fa580b3f0b3bf8040223481c16e398d2abb';
+  const apiKey = 'tk_ea4ff46c723149776d64ead0ea0b1ff042d6bd762f00453b';
   const url = `wss://api.tik.tools?uniqueId=${username}&apiKey=${apiKey}`;
 
   console.log(`Testing connection for url: ${url}`);

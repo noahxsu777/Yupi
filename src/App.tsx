@@ -173,7 +173,7 @@ export default function App() {
 
   // TikTok Live High-Speed Connection parameters (handled transparently)
   const [premiumConnection, setPremiumConnection] = useState<boolean>(true);
-  const [connectionKey, setConnectionKey] = useState<string>('tk_235e481d7e949fa580b3f0b3bf8040223481c16e398d2abb');
+  const [connectionKey, setConnectionKey] = useState<string>('tk_ea4ff46c723149776d64ead0ea0b1ff042d6bd762f00453b');
 
   const [wakeLockActive, setWakeLockActive] = useState<boolean>(false);
   const wakeLockRef = useRef<any>(null);
@@ -1609,8 +1609,8 @@ export default function App() {
         // - OR it is one of the known heavy/expensive gifts based on its ID or Name that the user specified
         const isKnownHighValue = 
           diamondCount >= 8 ||
-          [6369, 5765, 5794, 14488, 15100, 15099, 6820, 11046, 19448, 19447, 17100, 9947, 8914, 19445, 19168, 14109, 19446, 7264, 7168, 6781, 6427, 6267, 6104, 6097, 5978, 5879, 5659, 5658, 5585, 5586, 13651].includes(Number(giftId)) ||
-          ['lion', 'motorcycle', 'coconut', 'capybara', 'wave firework', 'balloons', 'whale', 'galaxy', 'piñata', 'univers', 'leon', 'león', 'interstellar', 'falcon', 'castle', 'train'].some(keyword => giftName.toLowerCase().includes(keyword));
+          [6369, 5765, 5794, 14488, 15100, 15099, 6820, 11046, 19448, 19447, 17100, 9947, 8914, 19445, 19168, 14109, 19446, 7264, 7168, 6781, 6427, 6267, 6104, 6097, 5978, 5879, 5659, 5658, 5585, 5586, 13651, 7934].includes(Number(giftId)) ||
+          ['lion', 'motorcycle', 'coconut', 'capybara', 'wave firework', 'balloons', 'whale', 'galaxy', 'piñata', 'univers', 'leon', 'león', 'interstellar', 'falcon', 'castle', 'train', 'heart me', 'me encanta'].some(keyword => giftName.toLowerCase().includes(keyword));
 
         // Create an exact user-gift debouncer key to group the entire rapid-fire tap succession
         const userGiftComboKey = `${data.uniqueId || ''}-${giftId || giftName}`;
@@ -1631,8 +1631,8 @@ export default function App() {
           if (isKnownHighValue) {
             // Legendary/High value: Play instantly on first frame for zero-lag response!
             shouldPlaySound = true;
-          } else if (repeatEnd) {
-            // Cheap/normal value: Play only when combo ends to prevent audio spam
+          } else if (repeatEnd || repeatCount === 1) {
+            // Cheap/normal value: Play only when combo ends to prevent audio spam, or if it is a single-event send (repeatCount === 1)
             shouldPlaySound = true;
           }
         }
