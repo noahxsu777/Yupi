@@ -15,19 +15,19 @@
     <script type="module" src="/src/main.tsx"></script>
     <script>
       if ('serviceWorker' in navigator) {
-        navigator.serviceWorker.getRegistrations().then(function(registrations) {
-          for(let registration of registrations) {
-            registration.unregister().then(() => {
-              console.log('Service Worker unregistered successfully.');
-            });
-          }
-        });
-      }
-      if ('caches' in window) {
-        caches.keys().then(function(names) {
-          for (let name of names) {
-            caches.delete(name);
-          }
+        window.addEventListener('load', function() {
+          navigator.serviceWorker.register('/sw.js').then(function(reg) {
+            console.log('Service Worker registrado correctamente:', reg.scope);
+            
+            // Proactively request notification permission on first mount to support background fallback
+            if ('Notification' in window && Notification.permission === 'default') {
+              Notification.requestPermission().then(function(permission) {
+                console.log('Permiso de notificaciones:', permission);
+              });
+            }
+          }).catch(function(err) {
+            console.error('Fallo al registrar Service Worker:', err);
+          });
         });
       }
     </script>

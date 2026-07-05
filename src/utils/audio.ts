@@ -390,10 +390,22 @@ export function updateMediaSessionMetadata(title: string, artist: string, album:
 
 export function playSoundFromUrlWithCompletion(url: string, volume: number = 0.5): Promise<void> {
   return new Promise((resolve) => {
+    // Add an absolute safety timeout of 7 seconds to guarantee queue never blocks
+    const safetyTimeout = setTimeout(() => {
+      console.warn('[AudioQueue] Sound play timed out (7s limit). Force resolving.');
+      resolve();
+    }, 7000);
+
+    const originalResolve = resolve;
+    const resolveWithClear = () => {
+      clearTimeout(safetyTimeout);
+      originalResolve();
+    };
+
     resolveSoundUrl(url).then(resolvedUrl => {
       if (!resolvedUrl) {
         playSynthesizedSound('magic', volume);
-        setTimeout(resolve, 500);
+        setTimeout(resolveWithClear, 500);
         return;
       }
       try {
@@ -434,7 +446,7 @@ export function playSoundFromUrlWithCompletion(url: string, volume: number = 0.5
 
         const handleEnded = () => {
           cleanUp();
-          resolve();
+          resolveWithClear();
         };
 
         let fallbackStarted = false;
@@ -447,7 +459,7 @@ export function playSoundFromUrlWithCompletion(url: string, volume: number = 0.5
         const playDirectFallback = () => {
           if (!rawUrl) {
             playSynthesizedSound('magic', volume);
-            setTimeout(resolve, 500);
+            setTimeout(resolveWithClear, 500);
             return;
           }
 
@@ -463,7 +475,7 @@ export function playSoundFromUrlWithCompletion(url: string, volume: number = 0.5
 
           const fallbackHandleEnded = () => {
             fallbackCleanUp();
-            resolve();
+            resolveWithClear();
           };
 
           let secondFallbackStarted = false;
@@ -471,7 +483,7 @@ export function playSoundFromUrlWithCompletion(url: string, volume: number = 0.5
             if (secondFallbackStarted) return;
             secondFallbackStarted = true;
             playSynthesizedSound('magic', volume);
-            setTimeout(resolve, 500);
+            setTimeout(resolveWithClear, 500);
           };
 
           const fallbackHandleError = (eFallback: any) => {
@@ -506,11 +518,11 @@ export function playSoundFromUrlWithCompletion(url: string, volume: number = 0.5
       } catch (err) {
         console.error('[AudioQueue] Failed playing custom URL sound:', err);
         playSynthesizedSound('magic', volume);
-        setTimeout(resolve, 500);
+        setTimeout(resolveWithClear, 500);
       }
     }).catch(() => {
       playSynthesizedSound('magic', volume);
-      setTimeout(resolve, 500);
+      setTimeout(resolveWithClear, 500);
     });
   });
 }
@@ -666,8 +678,19 @@ function runSingleSpeak(item: TtsTrack): Promise<void> {
           }
         };
 
-        utterance.onend = done;
-        utterance.onerror = done;
+        // Add a strict timeout of 6 seconds for browser speech synthesis to prevent blocking
+        const browserTtsTimeout = setTimeout(() => {
+          console.warn('[TTS] Browser SpeechSynthesis timed out (6s limit). Force resolving.');
+          done();
+        }, 6000);
+
+        const doneWithClear = () => {
+          clearTimeout(browserTtsTimeout);
+          done();
+        };
+
+        utterance.onend = doneWithClear;
+        utterance.onerror = doneWithClear;
 
         // Chrome/Safari speech safety: call resume right before speaking to wake up engine
         if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
@@ -714,13 +737,13 @@ function runSingleSpeak(item: TtsTrack): Promise<void> {
         }
       };
 
-      // Timeout safety (30 seconds max per speech)
+      // Shorter timeout safety for Cloud TTS (10 seconds max per speech)
       const timeout = setTimeout(() => {
         try {
           audio.pause();
         } catch (e) {}
         done();
-      }, 30000);
+      }, 10000);
 
       let fallbackStarted = false;
       const triggerTtsFallback = () => {
@@ -744,8 +767,19 @@ function runSingleSpeak(item: TtsTrack): Promise<void> {
               utterance.voice = spanishVoice;
             }
             
-            utterance.onend = done;
-            utterance.onerror = done;
+            // Add a strict timeout of 6 seconds for fallback browser SpeechSynthesis
+            const fallbackTimeout = setTimeout(() => {
+              console.warn('[TTS Fallback] Browser SpeechSynthesis timed out (6s limit). Force resolving.');
+              done();
+            }, 6000);
+
+            const doneWithClearFallback = () => {
+              clearTimeout(fallbackTimeout);
+              done();
+            };
+
+            utterance.onend = doneWithClearFallback;
+            utterance.onerror = doneWithClearFallback;
             window.speechSynthesis.speak(utterance);
           } catch (err) {
             console.error('[CloudTTS Fallback] Speech synthesis fallback crashed:', err);

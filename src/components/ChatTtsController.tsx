@@ -320,10 +320,25 @@ export default function ChatTtsController({
                 type="button"
                 onClick={() => {
                   let next: ('todos' | 'moderadores' | 'superfans')[];
-                  if (isSelected) {
-                    next = ttsReaderTargets.filter((t) => t !== option);
+                  if (option === 'todos') {
+                    if (isSelected) {
+                      // Deselecting todos leaves it empty, default back to empty or let user select
+                      next = [];
+                    } else {
+                      // Selecting todos clears other specific targets as they are redundant
+                      next = ['todos'];
+                    }
                   } else {
-                    next = [...ttsReaderTargets, option];
+                    if (isSelected) {
+                      next = ttsReaderTargets.filter((t) => t !== option);
+                    } else {
+                      // Selecting a specific target automatically removes 'todos' to prevent override confusion
+                      next = [...ttsReaderTargets.filter((t) => t !== 'todos'), option];
+                    }
+                  }
+                  if (next.length === 0) {
+                    // Fallback to 'todos' to avoid silent chat by accident
+                    next = ['todos'];
                   }
                   onUpdateTtsReaderTargets(next);
                 }}
@@ -357,6 +372,11 @@ export default function ChatTtsController({
             <option value="tiktok">🎵 Voces de TikTok</option>
             <option value="browser">🖥️ Voces del Dispositivo / Navegador</option>
           </select>
+          {ttsProvider === 'browser' && (
+            <div className="text-[10px] text-yellow-400 bg-yellow-500/10 border border-yellow-500/25 p-2 rounded leading-relaxed mt-1 animate-in fade-in duration-200 font-sans">
+              ⚠️ <strong>Atención segundo plano:</strong> Las voces nativas del dispositivo son suspendidas por tu celular al cambiar de app. Para que el TTS suene <strong>siempre</strong> en segundo plano de fondo, selecciona un proveedor en la nube como <strong>StreamElements</strong> o <strong>Edge TTS</strong>.
+            </div>
+          )}
         </div>
 
         {/* Dynamic Voice Selector based on the active provider */}

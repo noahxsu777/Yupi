@@ -2,7 +2,7 @@ import express from 'express';
 import path from 'path';
 import fs from 'fs';
 import { createServer as createViteServer } from 'vite';
-import tiktokLiveConnector from 'tiktok-live-connector';
+import { TikTokLiveConnection as WebcastPushConnection } from 'tiktok-live-connector';
 import * as cheerio from 'cheerio';
 import { WebSocket } from 'ws';
 import { EventEmitter } from 'events';
@@ -28,7 +28,7 @@ if (process.env.GEMINI_API_KEY) {
   console.log('[Gemini] GEMINI_API_KEY is not defined. DJ Towa recommendations will run on high-quality presets.');
 }
 
-const { WebcastPushConnection } = tiktokLiveConnector;
+// WebcastPushConnection is imported as TikTokLiveConnection alias from tiktok-live-connector
 
 class PremiumHighSpeedConnection extends EventEmitter {
   private ws: any = null;
@@ -52,6 +52,7 @@ class PremiumHighSpeedConnection extends EventEmitter {
       let resolved = false;
       let hasReceivedEvents = false;
       let fallbackTimeout: NodeJS.Timeout | null = null;
+      let silentWatchdog: NodeJS.Timeout | null = null;
 
       const triggerStandardFallback = () => {
         if (this.hasFallenBack || this.isDisconnectedExplicitly) return;
@@ -59,6 +60,10 @@ class PremiumHighSpeedConnection extends EventEmitter {
         if (fallbackTimeout) {
           clearTimeout(fallbackTimeout);
           fallbackTimeout = null;
+        }
+        if (silentWatchdog) {
+          clearTimeout(silentWatchdog);
+          silentWatchdog = null;
         }
 
         console.log(`[HighSpeed-VIP] WebSocket did not maintain open channel or failed for @${this.username}. Initiating silent standard fallback...`);
@@ -201,6 +206,20 @@ class PremiumHighSpeedConnection extends EventEmitter {
             resolved = true;
             resolve({ roomId: `Premium-HighSpeed-${this.username}` });
           }
+
+          // Start watchdog timer. If we don't receive any stream event within 8 seconds,
+          // we gracefully fallback to standard scraper to verify if the stream is live.
+          silentWatchdog = setTimeout(() => {
+            if (!hasReceivedEvents && !this.hasFallenBack) {
+              console.warn(`[HighSpeed-VIP] Connection to @${this.username} was silent/received no events for 8 seconds. Triggering standard backup fallback to check stream status...`);
+              if (this.ws) {
+                try {
+                  this.ws.close();
+                } catch (e) {}
+              }
+              triggerStandardFallback();
+            }
+          }, 8000);
         });
 
         this.ws.on('message', (raw: any) => {
@@ -214,6 +233,10 @@ class PremiumHighSpeedConnection extends EventEmitter {
               
               // We received some event (could be comment, gift, like, join, roomInfo)
               hasReceivedEvents = true;
+              if (silentWatchdog) {
+                clearTimeout(silentWatchdog);
+                silentWatchdog = null;
+              }
 
               console.log(`[HighSpeed-VIP] Raw Event: ${evName} | Payload keys:`, Object.keys(eventPayload || {}));
 
@@ -307,6 +330,10 @@ class PremiumHighSpeedConnection extends EventEmitter {
         this.ws.on('close', (code: number, reason: string) => {
           this.isConnected = false;
           console.log(`[HighSpeed-VIP] Closed connection to @${this.username}. Code: ${code}. Reason: ${reason}`);
+          if (silentWatchdog) {
+            clearTimeout(silentWatchdog);
+            silentWatchdog = null;
+          }
           
           if (!hasReceivedEvents && !this.hasFallenBack) {
             triggerStandardFallback();
@@ -317,6 +344,10 @@ class PremiumHighSpeedConnection extends EventEmitter {
 
         this.ws.on('error', (err: any) => {
           console.error(`[HighSpeed-VIP] Socket error on @${this.username}:`, err);
+          if (silentWatchdog) {
+            clearTimeout(silentWatchdog);
+            silentWatchdog = null;
+          }
           if (!hasReceivedEvents && !this.hasFallenBack) {
             triggerStandardFallback();
           } else {

@@ -10,11 +10,13 @@ import { doc, getDoc, setDoc, onSnapshot, runTransaction } from 'firebase/firest
 import { LiveEvent, GiftSoundMapping, PresetSound, SuperFan, SuperFanAlertData } from './types';
 import { playSynthesizedSound, playSoundFromUrl, speakText, queueSound, playSoundFromUrlWithCompletion, playSynthesizedSoundWithCompletion, stopAllAudio, startBackgroundPriorityMode, stopBackgroundPriorityMode, stopActiveTts, unlockAudio, recoverBackgroundAudioState } from './utils/audio';
 import GiftSoundConfig from './components/GiftSoundConfig';
+import { useBackgroundAudio } from './hooks/useBackgroundAudio';
 import { GIFT_CATALOG } from './data/gifts';
 
 import SoundAlertOverlay, { AlertData } from './components/SoundAlertOverlay';
 import LiveEventFeed from './components/LiveEventFeed';
 import ChatTtsController from './components/ChatTtsController';
+import SuperFansController from './components/SuperFansController';
 import YoutubeRadio, { YoutubeSong } from './components/YoutubeRadio';
 import ErrorBoundary from './components/ErrorBoundary';
 
@@ -48,6 +50,7 @@ import {
   Smartphone,
   Moon,
   Zap,
+  Cpu,
   Download,
   Upload,
   Trash2,
@@ -151,11 +154,14 @@ const DEFAULT_MAPPINGS: GiftSoundMapping[] = [
   { giftName: 'Corazón', soundId: 'magic', volume: 0.8, label: 'Corazón', iconUrl: 'https://p16-webcast.tiktokcdn.com/img/webcast/919f18ed0f8b05afaf4528148e65893b.png~tplv-obj.png' },
   { giftName: 'Capybara', giftId: 14488, soundId: 'magic', volume: 0.8, label: 'Capibara 🐹', iconUrl: 'https://p16-webcast.tiktokcdn.com/img/alisg/webcast-sg/resource/6703facdac34caefbd0617a6321afe9b.png~tplv-obj.webp', triggerRoulette: true },
   { giftName: 'Lion', giftId: 6369, soundId: 'airhorn', volume: 0.9, label: 'León', iconUrl: 'https://p16-webcast.tiktokcdn.com/img/webcast/efc948e9cc3fe0710609b5cecf3f6ff3.png~tplv-obj.png' },
-  { giftName: 'León', giftId: 6369, soundId: 'airhorn', volume: 0.9, label: 'León', iconUrl: 'https://p16-webcast.tiktokcdn.com/img/webcast/efc948e9cc3fe0710609b5cecf3f6ff3.png~tplv-obj.png' }
+  { giftName: 'León', giftId: 6369, soundId: 'airhorn', volume: 0.9, label: 'León', iconUrl: 'https://p16-webcast.tiktokcdn.com/img/webcast/efc948e9cc3fe0710609b5cecf3f6ff3.png~tplv-obj.png' },
+  { giftName: 'FOLLOW', soundId: 'triumph', volume: 0.7, label: 'Nuevo Seguidor 👤' },
+  { giftName: 'SHARE', soundId: 'bubble', volume: 0.7, label: 'Compartido 🚀' }
 ];
 
 export default function App() {
   const [username, setUsername] = useState('');
+  const [audioUnlocked, setAudioUnlocked] = useState<boolean>(true);
   
   // Real-time server/database synchronization states (No localStorage / sessionStorage)
   const [autoSaveActive, setAutoSaveActive] = useState<boolean>(false);
@@ -166,6 +172,7 @@ export default function App() {
   const [activeConnectedUser, setActiveConnectedUser] = useState<string>('');
   const [connectionStatus, setConnectionStatus] = useState<'disconnected' | 'connecting' | 'live' | 'error'>('disconnected');
   const [connectionError, setConnectionError] = useState<string | null>(null);
+  const [isOfflineSimulation, setIsOfflineSimulation] = useState<boolean>(false);
   
   // Advanced link options of tiktok-live-connector
   const [sessionId, setSessionId] = useState('');
@@ -176,6 +183,7 @@ export default function App() {
   const [connectionKey, setConnectionKey] = useState<string>('tk_ea4ff46c723149776d64ead0ea0b1ff042d6bd762f00453b');
 
   const [wakeLockActive, setWakeLockActive] = useState<boolean>(false);
+  const [lowMemoryMode, setLowMemoryMode] = useState<boolean>(() => localStorage.getItem('lowMemoryMode') === 'true');
   const wakeLockRef = useRef<any>(null);
   const userWantsWakeLockRef = useRef<boolean>(false);
 
@@ -224,9 +232,10 @@ export default function App() {
     const commentLower = cleanComment.toLowerCase();
 
     const userStr = user.toLowerCase();
+    const currentSuperFans = superFansRef.current;
 
     // Determine user status
-    const isSuperFanMod = superFans.some(sf => {
+    const isSuperFanMod = currentSuperFans.some(sf => {
       const sfUniqueId = (sf.uniqueId || '').toLowerCase();
       const sfNickname = (sf.nickname || '').toLowerCase();
       return sfUniqueId === userStr && (sfNickname.includes('mod') || sfNickname.includes('🛡️'));
@@ -235,7 +244,7 @@ export default function App() {
                   userStr.includes('mod') || 
                   isSuperFanMod;
                   
-    const isSuperFan = superFans.some(sf => (sf.uniqueId || '').toLowerCase() === userStr);
+    const isSuperFan = currentSuperFans.some(sf => (sf.uniqueId || '').toLowerCase() === userStr);
 
     if (commentLower.startsWith('!play ')) {
       const songQuery = cleanComment.substring(6).trim();
@@ -275,6 +284,9 @@ export default function App() {
   const [cloudLoadStatus, setCloudLoadStatus] = useState<'idle' | 'loading' | 'loaded' | 'error'>('idle');
   const [firestoreQuotaExceeded, setFirestoreQuotaExceeded] = useState<boolean>(false);
 
+  // Background audio focus queue controller
+  const { queueAudioAlert, unlockBackgroundAudio } = useBackgroundAudio();
+
   // Keep track of the last event's timestamp so we can pick up any missed events if the phone locks/reconnects
   const lastEventTimestampRef = useRef<number>(Date.now());
 
@@ -290,10 +302,18 @@ export default function App() {
       console.log('[System Alert Logged Silently]', messageText);
     };
 
+    // Try to unlock immediately on mount in case browser permission is already granted
+    try {
+      unlockAudio();
+      unlockBackgroundAudio();
+    } catch (e) {}
+
     // Robust audio unlock on first user gesture anywhere in the iframe/browser tab
     const handleGlobalUserUnlock = () => {
       try {
         unlockAudio();
+        unlockBackgroundAudio();
+        setAudioUnlocked(true);
         console.log('[Audio] Successfully unlocked audio and speechSynthesis context on human interaction.');
         window.removeEventListener('click', handleGlobalUserUnlock);
         window.removeEventListener('touchstart', handleGlobalUserUnlock);
@@ -354,8 +374,9 @@ export default function App() {
         if (buffered.length > 0) {
           setEvents(prev => {
             const combined = [...prev, ...buffered];
-            if (combined.length > 150) {
-              return combined.slice(-150);
+            const limit = lowMemoryMode ? 40 : 150;
+            if (combined.length > limit) {
+              return combined.slice(-limit);
             }
             return combined;
           });
@@ -424,6 +445,39 @@ export default function App() {
     setSuperFanWelcomeEnabled(!superFanWelcomeEnabled);
   };
   const [aiVoiceMode, setAiVoiceMode] = useState<string>('normal');
+
+  const mutedRef = useRef(muted);
+  useEffect(() => { mutedRef.current = muted; }, [muted]);
+
+  const ttsEnabledRef = useRef(ttsEnabled);
+  useEffect(() => { ttsEnabledRef.current = ttsEnabled; }, [ttsEnabled]);
+
+  const ttsVolumeRef = useRef(ttsVolume);
+  useEffect(() => { ttsVolumeRef.current = ttsVolume; }, [ttsVolume]);
+
+  const ttsProviderRef = useRef(ttsProvider);
+  useEffect(() => { ttsProviderRef.current = ttsProvider; }, [ttsProvider]);
+
+  const ttsVoiceURIRef = useRef(ttsVoiceURI);
+  useEffect(() => { ttsVoiceURIRef.current = ttsVoiceURI; }, [ttsVoiceURI]);
+
+  const ttsRateRef = useRef(ttsRate);
+  useEffect(() => { ttsRateRef.current = ttsRate; }, [ttsRate]);
+
+  const ttsReadUsernamesRef = useRef(ttsReadUsernames);
+  useEffect(() => { ttsReadUsernamesRef.current = ttsReadUsernames; }, [ttsReadUsernames]);
+
+  const ttsReaderTargetsRef = useRef(ttsReaderTargets);
+  useEffect(() => { ttsReaderTargetsRef.current = ttsReaderTargets; }, [ttsReaderTargets]);
+
+  const aiVoiceModeRef = useRef(aiVoiceMode);
+  useEffect(() => { aiVoiceModeRef.current = aiVoiceMode; }, [aiVoiceMode]);
+
+  const rouletteEnabledRef = useRef(rouletteEnabled);
+  useEffect(() => { rouletteEnabledRef.current = rouletteEnabled; }, [rouletteEnabled]);
+
+  const superFansRef = useRef(superFans);
+  useEffect(() => { superFansRef.current = superFans; }, [superFans]);
 
   const [backgroundPriority, setBackgroundPriority] = useState<boolean>(true); // Default to true (Active background priority!)
 
@@ -1091,8 +1145,42 @@ export default function App() {
     setTtsReaderTargets(targets);
   };
 
+  const handleAddSuperFanFromFeed = (user: { uniqueId: string; nickname: string; profilePictureUrl?: string }) => {
+    const cleanId = user.uniqueId.replace('@', '').trim();
+    if (!cleanId) return;
+
+    const exists = superFans.some(sf => sf.uniqueId.toLowerCase() === cleanId.toLowerCase());
+    if (exists) {
+      appendSystemMessage(`⚠️ @${cleanId} ya es un Súper Fan registrado.`);
+      return;
+    }
+
+    const newFan: SuperFan = {
+      uniqueId: cleanId,
+      nickname: user.nickname || cleanId,
+      fanLevel: 10,
+      badgeLevel: 'Estrella',
+      avatarUrl: user.profilePictureUrl || `https://api.dicebear.com/7.x/pixel-art/svg?seed=${cleanId}`,
+      joinMessage: `¡Súper Fan ${user.nickname || cleanId} se unió al directo!`
+    };
+
+    setSuperFans(prev => [...prev, newFan]);
+    appendSystemMessage(`👑 ¡Felicidades! @${cleanId} ha sido promovido a Súper Fan con éxito.`);
+  };
+
   // Helper trigger to synthesize speech for comments
   const triggerChatTts = (userUniqueId: string, nickname: string, commentText: string, isEventMod?: boolean, eventId?: string) => {
+    const ttsEnabled = ttsEnabledRef.current;
+    const muted = mutedRef.current;
+    const superFans = superFansRef.current;
+    const ttsReaderTargets = ttsReaderTargetsRef.current;
+    const ttsReadUsernames = ttsReadUsernamesRef.current;
+    const ttsVolume = ttsVolumeRef.current;
+    const ttsVoiceURI = ttsVoiceURIRef.current;
+    const ttsRate = ttsRateRef.current;
+    const ttsProvider = ttsProviderRef.current;
+    const aiVoiceMode = aiVoiceModeRef.current;
+
     if (!ttsEnabled) {
       console.log('[TTS-Diagnostic] Chat TTS is disabled by user settings. Skipping comment speech:', commentText);
       return;
@@ -1117,7 +1205,8 @@ export default function App() {
         return;
       }
       spokenCommentIdsRef.current.add(eventId);
-      if (spokenCommentIdsRef.current.size > 1200) {
+      const idsLimit = lowMemoryMode ? 100 : 1200;
+      if (spokenCommentIdsRef.current.size > idsLimit) {
         const first = spokenCommentIdsRef.current.keys().next().value;
         if (first) spokenCommentIdsRef.current.delete(first);
       }
@@ -1134,29 +1223,36 @@ export default function App() {
     spokenCommentSignaturesRef.current.set(signatureKey, now);
 
     // Periodically prune the signature map
-    if (spokenCommentSignaturesRef.current.size > 800) {
+    const sigsLimit = lowMemoryMode ? 100 : 800;
+    if (spokenCommentSignaturesRef.current.size > sigsLimit) {
       for (const [k, timestamp] of spokenCommentSignaturesRef.current.entries()) {
-        if (now - timestamp > 30000) {
+        if (now - timestamp > (lowMemoryMode ? 15000 : 30000)) {
           spokenCommentSignaturesRef.current.delete(k);
         }
       }
     }
 
     // Filter which users to speak based on target option (todos, moderadores, superfans)
+    const cleanId = (id: string) => (id || '').toLowerCase().replace(/^@/, '').trim();
+    const cleanNick = (nick: string) => (nick || '').toLowerCase().trim();
+
+    const uId = cleanId(userUniqueId);
+    const uNick = cleanNick(nickname);
+
     const isSuperFanMod = superFans.some(sf => {
-      const sfUniqueId = (sf.uniqueId || '').toLowerCase();
-      const sfNickname = (sf.nickname || '').toLowerCase();
-      return (sfUniqueId === userStr || sfNickname === nickStr) && (sfNickname.includes('mod') || sfNickname.includes('🛡️'));
+      const sfUniqueId = cleanId(sf.uniqueId);
+      const sfNickname = cleanNick(sf.nickname);
+      return (sfUniqueId === uId || sfNickname === uNick) && (sfNickname.includes('mod') || sfNickname.includes('🛡️'));
     });
     const isMod = !!isEventMod || 
-                  userStr.includes('mod') || 
-                  nickStr.includes('mod') ||
+                  uId.includes('mod') || 
+                  uNick.includes('mod') ||
                   isSuperFanMod;
                   
     const isSuperFan = superFans.some(sf => {
-      const sfId = (sf.uniqueId || '').toLowerCase();
-      const sfNick = (sf.nickname || '').toLowerCase();
-      return sfId === userStr || sfNick === nickStr;
+      const sfId = cleanId(sf.uniqueId);
+      const sfNick = cleanNick(sf.nickname);
+      return (sfId && sfId === uId) || (sfNick && sfNick === uNick);
     });
 
     const isTodosActive = ttsReaderTargets.includes('todos');
@@ -1167,6 +1263,7 @@ export default function App() {
       const matchesMod = isModeradoresActive && isMod;
       const matchesSuperFan = isSuperfansActive && isSuperFan;
       if (!matchesMod && !matchesSuperFan) {
+        console.log(`[TTS-Filter] Skipping comment by @${userUniqueId} as it does not match active reader targets:`, ttsReaderTargets);
         return; // Filter out if neither matches
       }
     }
@@ -1175,9 +1272,9 @@ export default function App() {
 
     // Check if commentator is structured in Super Fans registry
     const activeSuperFan = superFans.find(sf => {
-      const sfId = (sf.uniqueId || '').toLowerCase();
-      const sfNick = (sf.nickname || '').toLowerCase();
-      return sfId === userStr || sfNick === nickStr;
+      const sfId = cleanId(sf.uniqueId);
+      const sfNick = cleanNick(sf.nickname);
+      return (sfId && sfId === uId) || (sfNick && sfNick === uNick);
     });
 
     if (activeSuperFan) {
@@ -1341,6 +1438,7 @@ export default function App() {
 
   // Audio trigger central handler
   const triggerAudioAlert = (giftName: string, repeatCount: number, giftId?: string | number) => {
+    const muted = mutedRef.current;
     if (muted) return;
 
     // Find custom sound mapping for the gift safely and strictly.
@@ -1361,42 +1459,31 @@ export default function App() {
     console.log(`[Alert-Audio] Mappings ref length: ${mappingsRef.current.length}`);
     console.log(`[Alert-Audio] Looking for gift: "${giftName}" (ID: ${giftId}). Found mapping:`, mapping);
 
-    const soundId = mapping ? mapping.soundId : 'magic'; // Fallback to cute magic synth
-    const volume = mapping ? mapping.volume : 0.6;
-    const customUrl = mapping ? mapping.customSoundUrl : undefined;
+    // Stop playing default sounds for unmapped gifts to avoid "music out of nowhere"
+    if (!mapping) {
+      console.log(`[Alert-Audio] No mapping configured for gift: "${giftName}" (ID: ${giftId}). Skipping sound.`);
+      return;
+    }
+
+    const soundId = mapping.soundId;
+    const volume = mapping.volume;
+    const customUrl = mapping.customSoundUrl;
 
     // Cap at peak 5 sound loops so massive streaks don't overload the sequential queue
     const count = Math.min(5, Math.max(1, repeatCount || 1));
     console.log(`[Alert-Audio] Playing INSTANT gift sound alert: Sound: ${soundId}, Volume: ${volume}, Gift: ${giftName}, Repeat: ${count}`);
 
-    const playChainSequentially = async () => {
-      for (let i = 0; i < count; i++) {
-        if (soundId === 'custom' && customUrl) {
-          try {
-            await playSoundFromUrlWithCompletion(customUrl, volume);
-          } catch (err) {
-            console.warn('[InstantAudio] Failed playing custom sound URL in chain:', err);
-            // Fallback immediately to a synth sound so we don't block forever
-            await playSynthesizedSoundWithCompletion('magic', volume);
-          }
-        } else {
-          const preset = PRESET_SOUNDS.find(p => p.id === soundId);
-          if (preset && preset.type === 'synth' && preset.synthType) {
-            await playSynthesizedSoundWithCompletion(preset.synthType, volume);
-          } else {
-            await playSynthesizedSoundWithCompletion('magic', volume);
-          }
-        }
-      }
-    };
-
-    queueSound(playChainSequentially);
+    // Queue sequentially in the background audio manager with system audio focus
+    for (let i = 0; i < count; i++) {
+      queueAudioAlert(giftName, soundId, volume, customUrl, giftId);
+    }
   };
 
   // Appends new gift into the queue to trigger graphics alert
   const triggerGraphicsAlert = (evt: LiveEvent) => {
     if (!evt.gift) return;
 
+    const rouletteEnabled = rouletteEnabledRef.current;
     const giftId = evt.gift.giftId;
     const giftName = evt.gift.giftName;
 
@@ -1452,6 +1539,7 @@ export default function App() {
     }
 
     setConnectionError(null);
+    setIsOfflineSimulation(false);
     setConnectionStatus('connecting');
     setConnectingPhase('iniciando');
     setActiveConnectedUser(targetUser);
@@ -1783,10 +1871,19 @@ export default function App() {
 
     sse.addEventListener('tiktokError', (e) => {
       const payload = JSON.parse(e.data);
-      setConnectionStatus('error');
-      setConnectingPhase('none');
-      setConnectionError(payload.error || 'Error de conexión.');
-      appendSystemMessage(`Error en TikTok Connection: ${payload.error}`);
+      if (payload.isOffline) {
+        setIsOfflineSimulation(true);
+        setConnectionStatus('live');
+        setConnectingPhase('none');
+        setConnectionError(null);
+        appendSystemMessage(`⚠️ @${targetUser} está desconectado. Se activó el Modo Simulación Offline de manera automática para que pruebes tus alertas, sonidos y ruleta.`);
+      } else {
+        setIsOfflineSimulation(false);
+        setConnectionStatus('error');
+        setConnectingPhase('none');
+        setConnectionError(payload.error || 'Error de conexión.');
+        appendSystemMessage(`Error en TikTok Connection: ${payload.error}`);
+      }
     });
 
     sse.onerror = (err) => {
@@ -1796,36 +1893,33 @@ export default function App() {
         // Ensure standard EventSource is closed so we can start fresh
         try { sse.close(); } catch (e) {}
 
-        if (reconnectCountRef.current < 3) {
-          reconnectCountRef.current += 1;
-          setConnectionStatus('error');
-          setConnectionError(`Conexión con el servidor interrumpida. Reconectando (Intento ${reconnectCountRef.current}/3)...`);
-          
-          setTimeout(() => {
-            if (connectionStatusRef.current !== 'disconnected') {
-              console.log(`[SSE] Autoreconnect watchdog: attempting reconnection ${reconnectCountRef.current}/3...`);
-              handleConnectStream(targetUser, true);
-            }
-          }, 4000);
-        } else {
-          setConnectionStatus('error');
-          setConnectingPhase('none');
-          setConnectionError('⚠️ Conexión en vivo no disponible tras 3 intentos. El creador podría estar inactivo (offline), o TikTok tiene bloqueos temporales de IP. El Modo Simulación está disponible para realizar pruebas.');
-          appendSystemMessage('Sincronizador automático: Se alcanzaron los intentos máximos de reconexión. Conexión de live directa en pausa.');
-        }
+        reconnectCountRef.current += 1;
+        setConnectionStatus('error');
+        
+        // Exponential backoff to avoid hammering the server, between 3s and 25s
+        const backoffTime = Math.min(3000 * Math.pow(1.3, Math.min(reconnectCountRef.current, 10)), 25000);
+        
+        setConnectionError(`⚠️ Conexión interrumpida. Reconectando automáticamente (Intento ${reconnectCountRef.current}, reintentando en ${Math.round(backoffTime / 1000)}s)...`);
+        appendSystemMessage(`Sincronizador automático: Reconexión en progreso (Intento ${reconnectCountRef.current}). Reintentando en ${Math.round(backoffTime / 1000)}s...`);
+        
+        setTimeout(() => {
+          if (connectionStatusRef.current !== 'disconnected') {
+            console.log(`[SSE] Autoreconnect watchdog: attempting reconnection ${reconnectCountRef.current}...`);
+            handleConnectStream(targetUser, true);
+          }
+        }, backoffTime);
       }
     };
   };
 
   // Continuous Connection Watchdog to ensure connection is maintained forever on PC/Live Stream setups
   const checkConnection = () => {
-    // Only automatically re-establish if the connection was actively 'live' and got disrupted
-    // DO NOT loop on 'error' or 'connecting' states to prevent infinite spinning loops
-    if (connectionStatusRef.current === 'live') {
+    // Automatically re-establish if connection was supposed to be active (live or error) and got disrupted
+    if (connectionStatusRef.current === 'live' || connectionStatusRef.current === 'error') {
       const activeUser = activeConnectedUser || username;
       if (activeUser && (!sseRef.current || sseRef.current.readyState === EventSource.CLOSED)) {
-        console.log('[Connection Watchdog] Live connection lost (SSE closed). Reconnecting...');
-        appendSystemMessage('Sincronizador automático: Reestableciendo conexión permanente...');
+        console.log('[Connection Watchdog] Connection lost or dead. Reconnecting...');
+        appendSystemMessage('Sincronizador automático: Restableciendo conexión permanente...');
         handleConnectStream(activeUser, true);
       }
     }
@@ -1837,6 +1931,56 @@ export default function App() {
 
   useEffect(() => {
     const watchdogInterval = setInterval(checkConnection, 12000);
+
+    // Setup an inline Web Worker timer for high-priority background execution
+    let bgWorker: Worker | null = null;
+    if (backgroundPriority && (connectionStatus === 'live' || connectionStatus === 'error')) {
+      if (typeof window !== 'undefined' && typeof Worker !== 'undefined') {
+        try {
+          console.log('[Worker-Watchdog] Initializing background Web Worker keep-alive timer...');
+          const code = `
+            let intervalId = null;
+            self.onmessage = function(e) {
+              if (e.data === 'start') {
+                if (intervalId) clearInterval(intervalId);
+                intervalId = setInterval(() => {
+                  self.postMessage('tick');
+                }, 4000); // Trigger tick every 4 seconds to forcefully prevent background tab throttling
+              } else if (e.data === 'stop') {
+                if (intervalId) {
+                  clearInterval(intervalId);
+                  intervalId = null;
+                }
+              }
+            };
+          `;
+          const blob = new Blob([code], { type: 'application/javascript' });
+          bgWorker = new Worker(URL.createObjectURL(blob));
+          
+          bgWorker.onmessage = (e) => {
+            if (e.data === 'tick') {
+              console.log('[Worker-Watchdog] High-priority background tick received.');
+              
+              // 1. Check & recover live stream connection if lost or dead
+              if (checkConnectionRef.current) {
+                checkConnectionRef.current();
+              }
+              
+              // 2. Proactively wake up and recover background audio contexts & loops to avoid system-level pause
+              try {
+                recoverBackgroundAudioState();
+              } catch (err) {
+                console.warn('[Worker-Watchdog] Error recovering background audio:', err);
+              }
+            }
+          };
+          
+          bgWorker.postMessage('start');
+        } catch (err) {
+          console.warn('[Worker-Watchdog] Failed to launch inline background worker:', err);
+        }
+      }
+    }
 
     // Instant trigger when returning to app (changing apps or unlocking screen)
     const handleVisibilityChange = () => {
@@ -1866,10 +2010,14 @@ export default function App() {
 
     return () => {
       clearInterval(watchdogInterval);
+      if (bgWorker) {
+        bgWorker.postMessage('stop');
+        bgWorker.terminate();
+      }
       document.removeEventListener('visibilitychange', handleVisibilityChange);
       window.removeEventListener('focus', handleFocus);
     };
-  }, [backgroundPriority]);
+  }, [backgroundPriority, connectionStatus]);
 
   const handleDisconnect = async () => {
     setConnectingPhase('none');
@@ -1879,6 +2027,7 @@ export default function App() {
       sseRef.current = null;
     }
     setConnectionStatus('disconnected');
+    setIsOfflineSimulation(false);
     appendSystemMessage(`Desconectado del servidor de alertas.`);
     
     // Explicit close on the server to recycle/disconnect Webcast Push sockets immediately
@@ -1944,6 +2093,28 @@ export default function App() {
       releaseWakeLock();
     } else {
       requestWakeLock();
+    }
+  };
+
+  const handleToggleLowMemoryMode = () => {
+    const newVal = !lowMemoryMode;
+    setLowMemoryMode(newVal);
+    localStorage.setItem('lowMemoryMode', String(newVal));
+    if (newVal) {
+      // Instantly prune events state to 40 items to free up memory immediately
+      setEvents(prev => prev.slice(-40));
+      // Clear and reduce internal tts deduplication maps
+      if (spokenCommentIdsRef.current.size > 100) {
+        const keys = Array.from(spokenCommentIdsRef.current.keys());
+        spokenCommentIdsRef.current = new Set(keys.slice(-100));
+      }
+      if (spokenCommentSignaturesRef.current.size > 100) {
+        const entries = Array.from(spokenCommentSignaturesRef.current.entries());
+        spokenCommentSignaturesRef.current = new Map(entries.slice(-100));
+      }
+      appendSystemMessage('⚡ Modo Bajo Consumo / Memoria activado. Historial de eventos limitado a 40 líneas y optimizaciones agresivas aplicadas.');
+    } else {
+      appendSystemMessage('💤 Modo Normal de Memoria restaurado. Historial extendido de hasta 150 líneas activado.');
     }
   };
 
@@ -2113,6 +2284,8 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-[#0F0F12] text-gray-300 font-sans flex flex-col relative overflow-x-hidden select-none">
+      
+
       
       {/* Subtle depth lighting backing - wrapped in overflow-hidden shell to prevent blank space scroll at bottom */}
       <div className="absolute inset-0 overflow-hidden pointer-events-none z-0">
@@ -2557,6 +2730,30 @@ export default function App() {
                   {wakeLockActive ? '🔒 ENCENDIDO' : '💤 NORMAL'}
                 </button>
               </div>
+
+              {/* Interactive low memory mode switch */}
+              <div className="flex flex-col gap-1 bg-black/30 border border-white/5 p-2 rounded">
+                <div className="flex items-center justify-between">
+                  <span className="text-[10px] text-gray-300 font-mono flex items-center gap-1.5 uppercase select-none">
+                    <Cpu className={`w-3.5 h-3.5 ${lowMemoryMode ? 'text-green-400 animate-pulse' : 'text-gray-500'}`} />
+                    Ahorro de Memoria (Bajo Consumo)
+                  </span>
+                  <button
+                    type="button"
+                    onClick={handleToggleLowMemoryMode}
+                    className={`px-2.5 py-1 text-[9.5px] font-mono rounded uppercase tracking-wide transition-all ${
+                      lowMemoryMode 
+                        ? 'bg-green-500/20 border border-green-500/50 text-green-400 font-bold' 
+                        : 'bg-black/50 border border-white/10 text-gray-400 hover:text-white'
+                    }`}
+                  >
+                    {lowMemoryMode ? '⚡ ACTIVADO' : '💤 NORMAL'}
+                  </button>
+                </div>
+                <p className="text-[9px] text-gray-500 leading-normal pl-5">
+                  Previene cierres y desconexiones inesperadas en celulares o laptops con poca memoria RAM reduciendo el historial a 40 líneas y aplicando limpiezas agresivas.
+                </p>
+              </div>
             </div>
 
             {/* Error notifications */}
@@ -2569,9 +2766,15 @@ export default function App() {
 
             {/* Connected hint */}
             {connectionStatus === 'live' && (
-              <div className="text-[10px] text-emerald-400 font-mono flex items-center gap-1.5 bg-emerald-500/5 p-2 px-3 rounded border border-emerald-500/10 uppercase tracking-tight">
-                <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
-                SINC_OK: @{activeConnectedUser} ({countActiveStreamSubscribers()} ACTIVO)
+              <div className={`text-[10px] font-mono flex items-center gap-1.5 p-2 px-3 rounded border uppercase tracking-tight ${
+                isOfflineSimulation
+                  ? 'text-amber-400 bg-amber-500/5 border-amber-500/15'
+                  : 'text-emerald-400 bg-emerald-500/5 border-emerald-500/10'
+              }`}>
+                <span className={`w-1.5 h-1.5 rounded-full animate-pulse ${isOfflineSimulation ? 'bg-amber-400' : 'bg-emerald-400'}`} />
+                {isOfflineSimulation 
+                  ? `MODO SIMULACIÓN: @${activeConnectedUser} (Offline)` 
+                  : `SINC_OK: @${activeConnectedUser} (${countActiveStreamSubscribers()} ACTIVO)`}
               </div>
             )}
           </section>
@@ -2632,6 +2835,12 @@ export default function App() {
             onUpdateTtsReaderTargets={handleUpdateTtsReaderTargets}
             superFanWelcomeEnabled={superFanWelcomeEnabled}
             onToggleSuperFanWelcome={handleToggleSuperFanWelcome}
+          />
+
+          {/* Súper Fans list and entry rules configuration manager panel */}
+          <SuperFansController
+            superFans={superFans}
+            onUpdateSuperFans={setSuperFans}
           />
 
           {/* CONFIGURACIÓN DE LA RULETA DE RETOS */}
@@ -3234,6 +3443,7 @@ export default function App() {
               events={events}
               onClearEvents={() => setEvents([])}
               superFans={superFans}
+              onAddSuperFan={handleAddSuperFanFromFeed}
             />
           </div>
 

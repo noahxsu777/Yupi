@@ -6,9 +6,10 @@ interface LiveEventFeedProps {
   events: LiveEvent[];
   onClearEvents: () => void;
   superFans?: SuperFan[];
+  onAddSuperFan?: (user: { uniqueId: string; nickname: string; profilePictureUrl?: string }) => void;
 }
 
-export default function LiveEventFeed({ events, onClearEvents, superFans = [] }: LiveEventFeedProps) {
+export default function LiveEventFeed({ events, onClearEvents, superFans = [], onAddSuperFan }: LiveEventFeedProps) {
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const [filter, setFilter] = useState<'all' | 'gifts' | 'chats' | 'social'>('all');
   const [searchText, setSearchText] = useState('');
@@ -217,11 +218,22 @@ export default function LiveEventFeed({ events, onClearEvents, superFans = [] }:
                     )}
                     
                     {/* Glowing Super Fan Badge indicator */}
-                    {evt.uniqueId && superFans.some(sf => sf.uniqueId && sf.uniqueId.toLowerCase() === evt.uniqueId.toLowerCase()) && (
+                    {evt.uniqueId && superFans.some(sf => sf.uniqueId && sf.uniqueId.toLowerCase().replace(/^@/, '').trim() === evt.uniqueId.toLowerCase().replace(/^@/, '').trim()) ? (
                       <span className="bg-gradient-to-r from-yellow-400 via-amber-500 to-pink-500 text-black text-[8px] font-black uppercase px-1.5 py-0.2 rounded-full border border-yellow-300 flex items-center gap-0.5 animate-pulse shadow">
                         <Sparkles className="w-2 h-2 text-black fill-black" />
                         Súper Fan
                       </span>
+                    ) : (
+                      evt.uniqueId && evt.type === 'chat' && onAddSuperFan && (
+                        <button
+                          type="button"
+                          onClick={() => onAddSuperFan({ uniqueId: evt.uniqueId, nickname: evt.nickname || evt.uniqueId, profilePictureUrl: evt.profilePictureUrl })}
+                          className="opacity-0 group-hover:opacity-100 bg-yellow-500/10 hover:bg-yellow-500/30 border border-yellow-500/30 text-yellow-400 text-[8.5px] font-bold uppercase px-1.5 py-0.5 rounded transition-all flex items-center gap-0.5 cursor-pointer leading-none"
+                          title="Hacer Súper Fan"
+                        >
+                          👑 +Súper Fan
+                        </button>
+                      )
                     )}
 
                     <span className="text-[9px] text-gray-600 font-mono ml-auto">{dateStr}</span>
